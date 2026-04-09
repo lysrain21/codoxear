@@ -411,18 +411,24 @@
 
       function providerChoiceToSettings(choice, agentBackend = "codex") {
         const backend = normalizeAgentBackendName(agentBackend);
-        const value = String(choice || "").trim() || "chatgpt";
-        if (backend === "pi") return { model_provider: value || null, preferred_auth_method: null };
+        const rawValue = String(choice || "").trim();
+        if (backend === "pi") return { model_provider: rawValue || null, preferred_auth_method: null };
+        const value = rawValue || "chatgpt";
         if (value === "chatgpt") return { model_provider: "openai", preferred_auth_method: "chatgpt" };
         if (value === "openai-api") return { model_provider: "openai", preferred_auth_method: "apikey" };
         return { model_provider: value, preferred_auth_method: "apikey" };
       }
 
       function sessionProviderChoice(s) {
+        const backend = sessionAgentBackend(s);
+        const explicit = s && typeof s.provider_choice === "string" ? s.provider_choice.trim() : "";
+        const provider = s && typeof s.model_provider === "string" ? s.model_provider.trim() : "";
+        if (backend === "pi") {
+          const fallback = String(defaultsForAgentBackend("pi").provider_choice || "").trim();
+          return provider || explicit || fallback;
+        }
         if (!s || typeof s !== "object") return "chatgpt";
-        const explicit = typeof s.provider_choice === "string" ? s.provider_choice.trim() : "";
         if (explicit) return explicit;
-        const provider = typeof s.model_provider === "string" ? s.model_provider.trim() : "";
         const auth = typeof s.preferred_auth_method === "string" ? s.preferred_auth_method.trim() : "";
         if (provider === "openai") return auth === "chatgpt" ? "chatgpt" : "openai-api";
         return provider || "chatgpt";
