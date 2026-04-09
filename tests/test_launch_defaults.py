@@ -6,6 +6,7 @@ from unittest.mock import patch
 from codoxear.server import _normalize_requested_model_provider
 from codoxear.server import _normalize_requested_preferred_auth_method
 from codoxear.server import _normalize_requested_service_tier
+from codoxear.server import _provider_choice_for_settings
 from codoxear.server import _read_codex_launch_defaults
 from codoxear.server import _read_new_session_defaults
 from codoxear.server import _read_pi_launch_defaults
@@ -93,6 +94,18 @@ preferred_auth_method = "chatgpt"
                 defaults = _read_codex_launch_defaults()
 
         self.assertEqual(defaults["provider_choice"], "chatgpt")
+
+    def test_provider_choice_for_settings_keeps_pi_provider_names(self) -> None:
+        self.assertEqual(
+            _provider_choice_for_settings(model_provider="openai", preferred_auth_method=None, agent_backend="pi"),
+            "openai",
+        )
+
+    def test_provider_choice_for_settings_maps_codex_openai_api_label(self) -> None:
+        self.assertEqual(
+            _provider_choice_for_settings(model_provider="openai", preferred_auth_method="apikey", agent_backend="codex"),
+            "openai-api",
+        )
 
     def test_read_codex_launch_defaults_collects_provider_names_by_section_key(self) -> None:
         with TemporaryDirectory() as td:

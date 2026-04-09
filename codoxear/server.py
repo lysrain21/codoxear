@@ -1611,7 +1611,10 @@ def _configured_model_providers(data: dict[str, Any]) -> list[str]:
     return providers
 
 
-def _provider_choice_for_settings(*, model_provider: str | None, preferred_auth_method: str | None) -> str:
+def _provider_choice_for_settings(*, model_provider: str | None, preferred_auth_method: str | None, agent_backend: str = "codex") -> str | None:
+    backend_name = normalize_agent_backend(agent_backend)
+    if backend_name == "pi":
+        return model_provider
     provider = model_provider or "openai"
     if provider == "openai":
         return "chatgpt" if preferred_auth_method == "chatgpt" else "openai-api"
@@ -3462,6 +3465,7 @@ class SessionManager:
                         "provider_choice": _provider_choice_for_settings(
                             model_provider=s.model_provider,
                             preferred_auth_method=s.preferred_auth_method,
+                            agent_backend=s.agent_backend,
                         ),
                         "model": s.model,
                         "reasoning_effort": s.reasoning_effort,
@@ -4631,6 +4635,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "provider_choice": _provider_choice_for_settings(
                             model_provider=model_provider,
                             preferred_auth_method=preferred_auth_method,
+                            agent_backend=s.agent_backend,
                         ),
                         "model": model,
                         "reasoning_effort": reasoning_effort,
