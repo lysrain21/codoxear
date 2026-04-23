@@ -27,7 +27,7 @@ import tomllib
 import traceback
 import urllib.parse
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +118,7 @@ def _strip_url_prefix(prefix: str, path: str) -> str | None:
 APP_DIR = _default_app_dir()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_ASSET_VERSION_PLACEHOLDER = "__CODOXEAR_ASSET_VERSION__"
+STATIC_ATTACH_MAX_BYTES_PLACEHOLDER = "__CODOXEAR_ATTACH_MAX_BYTES__"
 STATIC_ASSET_VERSION_FILES = ("app.js", "app.css")
 SOCK_DIR = APP_DIR / "socks"
 STATE_PATH = APP_DIR / "state.json"
@@ -176,11 +177,6 @@ VOICE_PUSH_SWEEP_SECONDS = float(os.environ.get("CODEX_WEB_VOICE_PUSH_SWEEP_SECO
 QUEUE_IDLE_GRACE_SECONDS = float(os.environ.get("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS", "10.0"))
 HARNESS_MAX_SCAN_BYTES = int(os.environ.get("CODEX_WEB_HARNESS_MAX_SCAN_BYTES", str(8 * 1024 * 1024)))
 DISCOVER_MIN_INTERVAL_SECONDS = float(os.environ.get("CODEX_WEB_DISCOVER_MIN_INTERVAL_SECONDS", "1.0"))
-CHAT_INIT_SEED_SCAN_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INIT_SEED_SCAN_BYTES", str(512 * 1024)))
-CHAT_INIT_MAX_SCAN_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INIT_MAX_SCAN_BYTES", str(128 * 1024 * 1024)))
-CHAT_INDEX_INCREMENT_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INDEX_INCREMENT_BYTES", str(2 * 1024 * 1024)))
-CHAT_INDEX_RESEED_THRESHOLD_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INDEX_RESEED_THRESHOLD_BYTES", str(16 * 1024 * 1024)))
-CHAT_INDEX_MAX_EVENTS = int(os.environ.get("CODEX_WEB_CHAT_INDEX_MAX_EVENTS", "12000"))
 METRICS_WINDOW = int(os.environ.get("CODEX_WEB_METRICS_WINDOW", "256"))
 FILE_READ_MAX_BYTES = int(os.environ.get("CODEX_WEB_FILE_READ_MAX_BYTES", str(2 * 1024 * 1024)))
 FILE_HISTORY_MAX = int(os.environ.get("CODEX_WEB_FILE_HISTORY_MAX", "20"))
@@ -191,8 +187,59 @@ GIT_DIFF_MAX_BYTES = int(os.environ.get("CODEX_WEB_GIT_DIFF_MAX_BYTES", str(800 
 GIT_DIFF_TIMEOUT_SECONDS = float(os.environ.get("CODEX_WEB_GIT_DIFF_TIMEOUT_SECONDS", "4.0"))
 GIT_WORKTREE_TIMEOUT_SECONDS = float(os.environ.get("CODEX_WEB_GIT_WORKTREE_TIMEOUT_SECONDS", "10.0"))
 GIT_CHANGED_FILES_MAX = int(os.environ.get("CODEX_WEB_GIT_CHANGED_FILES_MAX", "400"))
-ATTACH_UPLOAD_MAX_BYTES = int(os.environ.get("CODEX_WEB_ATTACH_MAX_BYTES", str(10 * 1024 * 1024)))
+ATTACH_UPLOAD_MAX_BYTES = int(os.environ.get("CODEX_WEB_ATTACH_MAX_BYTES", str(16 * 1024 * 1024)))
+ATTACH_UPLOAD_BODY_MAX_BYTES = int(
+    os.environ.get(
+        "CODEX_WEB_ATTACH_BODY_MAX_BYTES",
+        str((4 * ((ATTACH_UPLOAD_MAX_BYTES + 2) // 3)) + (64 * 1024)),
+    )
+)
 FILE_LIST_IGNORED_DIRS = frozenset({".git", ".hg", ".mypy_cache", ".pytest_cache", ".svn", "__pycache__", "build", "dist", "node_modules", "venv", ".venv"})
+MARKDOWN_EXTENSIONS = frozenset({"md", "markdown", "mdown", "mkd"})
+TEXTUAL_EXTENSIONS = frozenset(
+    {
+        "bash",
+        "c",
+        "cc",
+        "cfg",
+        "conf",
+        "cpp",
+        "css",
+        "csv",
+        "diff",
+        "go",
+        "h",
+        "hpp",
+        "htm",
+        "html",
+        "ini",
+        "java",
+        "js",
+        "json",
+        "jsonl",
+        "log",
+        "md",
+        "markdown",
+        "mdown",
+        "mkd",
+        "patch",
+        "py",
+        "rs",
+        "scss",
+        "sh",
+        "sql",
+        "svg",
+        "toml",
+        "ts",
+        "tsx",
+        "txt",
+        "xml",
+        "yaml",
+        "yml",
+        "zsh",
+    }
+)
+TEXTUAL_FILENAMES = frozenset({"dockerfile", "license", "makefile", "readme"})
 SIDEBAR_PRIORITY_HALF_LIFE_SECONDS = 8.0 * 3600.0
 SIDEBAR_PRIORITY_LAMBDA = math.log(2.0) / SIDEBAR_PRIORITY_HALF_LIFE_SECONDS
 RECENT_CWD_MAX = int(os.environ.get("CODEX_WEB_RECENT_CWD_MAX", "256"))
@@ -484,10 +531,19 @@ def _image_content_type(path: Path, raw: bytes) -> str | None:
     return None
 
 
+def _pdf_content_type(path: Path, raw: bytes) -> str | None:
+    if path.suffix.lower() == ".pdf" or raw.startswith(b"%PDF-"):
+        return "application/pdf"
+    return None
+
+
 def _file_kind(path: Path, raw: bytes) -> tuple[str, str | None]:
     ctype = _image_content_type(path, raw)
     if ctype is not None:
         return "image", ctype
+    ctype = _pdf_content_type(path, raw)
+    if ctype is not None:
+        return "pdf", ctype
     return "text", None
 
 
@@ -613,6 +669,63 @@ def _verify_cookie(value: str) -> dict[str, Any] | None:
         return None
 
 
+class MessageCursorError(ValueError):
+    pass
+
+
+def _sign_message_cursor(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    sig = hmac.new(HMAC_SECRET, raw, hashlib.sha256).digest()
+    return f"{_b64u(raw)}.{_b64u(sig)}"
+
+
+def _verify_message_cursor(token: str) -> dict[str, Any]:
+    try:
+        a, b = token.split(".", 1)
+        raw = _b64u_dec(a)
+        sig = _b64u_dec(b)
+        want = hmac.new(HMAC_SECRET, raw, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, want):
+            raise MessageCursorError("cursor_invalid")
+        payload = json.loads(raw.decode("utf-8"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise MessageCursorError("cursor_invalid")
+    if not isinstance(payload, dict):
+        raise MessageCursorError("cursor_invalid")
+    return payload
+
+
+def _encode_message_cursor(*, kind: str, session: "Session", pos: int) -> str:
+    return _sign_message_cursor(
+        {
+            "v": 1,
+            "kind": kind,
+            "thread_id": session.thread_id,
+            "log_path": str(session.log_path) if session.log_path is not None else None,
+            "pos": int(pos),
+        }
+    )
+
+
+def _decode_message_cursor(token: str, *, kind: str, session: "Session") -> int:
+    payload = _verify_message_cursor(token)
+    if payload.get("v") != 1 or payload.get("kind") != kind:
+        raise MessageCursorError("cursor_invalid")
+    if payload.get("thread_id") != session.thread_id:
+        raise MessageCursorError("cursor_invalid")
+    expected_log_path = str(session.log_path) if session.log_path is not None else None
+    if payload.get("log_path") != expected_log_path:
+        raise MessageCursorError("cursor_invalid")
+    pos = payload.get("pos")
+    if not isinstance(pos, int) or pos < 0:
+        raise MessageCursorError("cursor_invalid")
+    if session.log_path is not None and session.log_path.exists():
+        size = int(session.log_path.stat().st_size)
+        if pos > size:
+            raise MessageCursorError("cursor_invalid")
+    return int(pos)
+
+
 def _parse_cookies(header: str | None) -> dict[str, str]:
     if not header:
         return {}
@@ -651,6 +764,18 @@ def _set_auth_cookie(handler: http.server.BaseHTTPRequestHandler) -> None:
     handler.send_header("Set-Cookie", "; ".join(attrs))
 
 _PASSWORD_CACHE: str | None = None
+
+
+@dataclass(frozen=True)
+class ClientFileView:
+    kind: str
+    size: int
+    content_type: str | None = None
+    text: str | None = None
+    editable: bool = False
+    version: str | None = None
+    blocked_reason: str | None = None
+    viewer_max_bytes: int | None = None
 
 
 def _require_password() -> str:
@@ -699,11 +824,52 @@ def _file_content_version(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _file_extension(path: Path) -> str:
+    suffix = str(path.suffix or "").lower()
+    if not suffix.startswith("."):
+        return ""
+    return suffix[1:]
+
+
+def _markdown_kind(path: Path) -> str:
+    return "markdown" if _file_extension(path) in MARKDOWN_EXTENSIONS else "text"
+
+
+def _path_looks_textual(path: Path) -> bool:
+    ext = _file_extension(path)
+    if ext in TEXTUAL_EXTENSIONS:
+        return True
+    return str(path.name or "").strip().lower() in TEXTUAL_FILENAMES
+
+
+def _looks_like_text_bytes(raw: bytes) -> bool:
+    if b"\x00" in raw:
+        return False
+    for b in raw:
+        if b < 32 and b not in (9, 10, 12, 13, 27):
+            return False
+    return True
+
+
 def _decode_text_for_client(raw: bytes) -> tuple[str, bool]:
     try:
         return raw.decode("utf-8"), True
     except UnicodeDecodeError:
         return raw.decode("utf-8", errors="replace"), False
+
+
+def _decode_text_view_for_client(path: Path, raw: bytes) -> tuple[str, bool, str] | None:
+    if b"\x00" in raw:
+        return None
+    try:
+        text = raw.decode("utf-8")
+        editable = True
+    except UnicodeDecodeError:
+        if not _path_looks_textual(path) and not _looks_like_text_bytes(raw):
+            return None
+        text = raw.decode("utf-8", errors="replace")
+        editable = False
+    return text, editable, _file_content_version(raw)
 
 
 def _read_text_file_for_client(path: Path, *, max_bytes: int) -> tuple[str, int, bool, str]:
@@ -1225,7 +1391,7 @@ def _stage_uploaded_file(session_id: str, filename: str, raw: bytes, *, max_byte
         raise ValueError("file bytes required")
     data = bytes(raw)
     if len(data) > int(max_bytes):
-        raise ValueError("file too large")
+        raise ValueError(f"file too large (max {int(max_bytes)} bytes)")
     safe_name = _safe_filename(filename, default="file")
     subdir = (UPLOAD_DIR / session_id).resolve()
     subdir.mkdir(parents=True, exist_ok=True)
@@ -1423,50 +1589,65 @@ def _resolve_client_file_path(*, session_id: str, raw_path: str) -> Path:
 
 
 def _inspect_openable_file(path_obj: Path) -> tuple[bytes, int, str, str | None]:
-    if not path_obj.exists():
-        raise FileNotFoundError("file not found")
-    if not path_obj.is_file():
+    view = _read_client_file_view(path_obj)
+    if view.kind == "directory":
         raise ValueError("path is not a file")
-    try:
-        raw = path_obj.read_bytes()
-    except PermissionError as e:
-        raise PermissionError("permission denied") from e
-    size = len(raw)
-    if size > FILE_READ_MAX_BYTES:
-        raise ValueError(f"file too large (max {FILE_READ_MAX_BYTES} bytes)")
-    kind, image_ctype = _file_kind(path_obj, raw)
-    if kind != "image" and b"\x00" in raw:
+    if view.kind == "download_only":
+        if view.blocked_reason == "too_large":
+            raise ValueError(f"file too large (max {FILE_READ_MAX_BYTES} bytes)")
         raise ValueError("binary file not supported")
-    return raw, size, kind, image_ctype
+    raw = path_obj.read_bytes()
+    return raw, view.size, view.kind, view.content_type
 
 
 def _inspect_path_metadata(path_obj: Path) -> tuple[int, str, str | None]:
+    view = _read_client_file_view(path_obj)
+    return view.size, view.kind, view.content_type
+
+
+def _read_client_file_view(path_obj: Path) -> ClientFileView:
     if not path_obj.exists():
         raise FileNotFoundError("file not found")
+    if path_obj.is_dir():
+        return ClientFileView(kind="directory", size=0)
     if not path_obj.is_file():
         raise ValueError("path is not a file")
     try:
-        size = path_obj.stat().st_size
+        size = int(path_obj.stat().st_size)
         with path_obj.open("rb") as f:
-            prefix = f.read(64)
+            prefix = f.read(4096)
     except PermissionError as e:
         raise PermissionError("permission denied") from e
-    kind, image_ctype = _file_kind(path_obj, prefix)
-    if kind == "image":
-        return size, kind, image_ctype
-    if b"\x00" in prefix:
-        raise ValueError("binary file not supported")
+    kind, content_type = _file_kind(path_obj, prefix)
+    if kind in {"image", "pdf"}:
+        return ClientFileView(kind=kind, size=size, content_type=content_type)
     if size > FILE_READ_MAX_BYTES:
-        raise ValueError(f"file too large (max {FILE_READ_MAX_BYTES} bytes)")
-    return size, kind, image_ctype
+        return ClientFileView(
+            kind="download_only",
+            size=size,
+            blocked_reason="too_large",
+            viewer_max_bytes=FILE_READ_MAX_BYTES,
+        )
+    raw = path_obj.read_bytes()
+    text_payload = _decode_text_view_for_client(path_obj, raw)
+    if text_payload is None:
+        return ClientFileView(kind="download_only", size=size, blocked_reason="binary")
+    text, editable, version = text_payload
+    return ClientFileView(
+        kind=_markdown_kind(path_obj),
+        size=size,
+        text=text,
+        editable=editable,
+        version=version,
+    )
 
 
 def _read_text_or_image(path_obj: Path) -> tuple[str, int, str | None, bytes | None]:
-    size, kind, image_ctype = _inspect_path_metadata(path_obj)
-    if kind == "image":
-        return kind, size, image_ctype, None
+    view = _read_client_file_view(path_obj)
+    if view.kind in {"image", "pdf", "download_only", "directory"}:
+        return view.kind, view.size, view.content_type, None
     raw = path_obj.read_bytes()
-    return kind, size, image_ctype, raw
+    return view.kind, view.size, view.content_type, raw
 
 
 def _read_downloadable_file(path_obj: Path) -> tuple[bytes, int]:
@@ -1482,11 +1663,8 @@ def _read_downloadable_file(path_obj: Path) -> tuple[bytes, int]:
 
 
 def _inspect_client_path(path_obj: Path) -> tuple[int, str, str | None]:
-    if not path_obj.exists():
-        raise FileNotFoundError("file not found")
-    if path_obj.is_dir():
-        return 0, "directory", None
-    return _inspect_path_metadata(path_obj)
+    view = _read_client_file_view(path_obj)
+    return view.size, view.kind, view.content_type
 
 
 def _download_disposition(path_obj: Path) -> str:
@@ -1630,6 +1808,52 @@ def _provider_choice_for_settings(*, model_provider: str | None, preferred_auth_
     if provider == "openai":
         return "chatgpt" if preferred_auth_method == "chatgpt" else "openai-api"
     return provider
+
+
+def _new_queue_item_id() -> str:
+    return f"queue-{secrets.token_hex(8)}"
+
+
+def _new_queue_item(text: str, *, created_ts: float | None = None) -> dict[str, Any]:
+    ts = float(created_ts) if created_ts is not None else time.time()
+    if not math.isfinite(ts) or ts <= 0:
+        ts = time.time()
+    return {"id": _new_queue_item_id(), "text": str(text), "created_ts": ts}
+
+
+def _copy_queue_item(item: dict[str, Any]) -> dict[str, Any]:
+    created_ts = item.get("created_ts")
+    try:
+        ts = float(created_ts)
+    except (TypeError, ValueError):
+        ts = time.time()
+    if not math.isfinite(ts) or ts <= 0:
+        ts = time.time()
+    return {"id": str(item.get("id") or ""), "text": str(item.get("text") or ""), "created_ts": ts}
+
+
+def _coerce_queue_item(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        return _new_queue_item(raw)
+    if not isinstance(raw, dict):
+        return None
+    item_id = raw.get("id")
+    text = raw.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if not isinstance(item_id, str) or not item_id.strip():
+        item_id = _new_queue_item_id()
+    created_ts = raw.get("created_ts")
+    try:
+        ts = float(created_ts)
+    except (TypeError, ValueError):
+        ts = time.time()
+    if not math.isfinite(ts) or ts <= 0:
+        ts = time.time()
+    return {"id": item_id.strip(), "text": text, "created_ts": ts}
 
 
 def _read_codex_launch_defaults() -> dict[str, Any]:
@@ -1973,31 +2197,21 @@ def _extract_delivery_messages(objs: list[dict[str, Any]]) -> list[Any]:
     return _rollout_log._extract_delivery_messages(objs)
 
 
-def _read_jsonl_tail(path: Path, max_bytes: int) -> list[dict[str, Any]]:
-    return _rollout_log._read_jsonl_tail(path, max_bytes)
-
-
-def _read_chat_events_from_tail(
-    log_path: Path,
-    min_events: int = 120,
-    max_scan_bytes: int = 128 * 1024 * 1024,
-) -> list[dict[str, Any]]:
-    return _rollout_log._read_chat_events_from_tail(log_path, min_events=min_events, max_scan_bytes=max_scan_bytes)
-
-
-def _read_chat_tail_snapshot(
-    log_path: Path,
+def _read_jsonl_records_from_offset(
+    path: Path,
+    offset: int,
     *,
-    min_events: int,
-    initial_scan_bytes: int,
-    max_scan_bytes: int,
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None, int, bool, int]:
-    return _rollout_log._read_chat_tail_snapshot(
-        log_path,
-        min_events=min_events,
-        initial_scan_bytes=initial_scan_bytes,
-        max_scan_bytes=max_scan_bytes,
-    )
+    max_bytes: int = 2 * 1024 * 1024,
+) -> tuple[list[Any], int]:
+    return _rollout_log._read_jsonl_records_from_offset(path, offset, max_bytes=max_bytes)
+
+
+def _read_chat_tail_page(log_path: Path, *, limit: int) -> tuple[list[dict[str, Any]], int, int, bool]:
+    return _rollout_log._read_chat_tail_page(log_path, limit=limit)
+
+
+def _read_chat_history_page(log_path: Path, *, before_byte: int, limit: int) -> tuple[list[dict[str, Any]], int, bool]:
+    return _rollout_log._read_chat_history_page(log_path, before_byte=before_byte, limit=limit)
 
 
 def _event_ts(obj: dict[str, Any]) -> float | None:
@@ -2056,14 +2270,11 @@ class Session:
     meta_tools: int = 0
     meta_system: int = 0
     meta_log_off: int = 0
-    chat_index_events: list[dict[str, Any]] = field(default_factory=list)
-    chat_index_scan_bytes: int = 0
-    chat_index_scan_complete: bool = False
-    chat_index_log_off: int = 0
     delivery_log_off: int = 0
     idle_cache_log_off: int = -1
     idle_cache_value: bool | None = None
     queue_idle_since: float | None = None
+    queue_sending_item_id: str | None = None
     model_provider: str | None = None
     preferred_auth_method: str | None = None
     model: str | None = None
@@ -2086,7 +2297,7 @@ class SessionManager:
         self._sidebar_meta: dict[str, dict[str, Any]] = {}
         self._hidden_sessions: set[str] = set()
         self._files: dict[str, list[str]] = {}
-        self._queues: dict[str, list[str]] = {}
+        self._queues: dict[str, list[dict[str, Any]]] = {}
         self._recent_cwds: dict[str, float] = {}
         self._harness_last_injected: dict[str, float] = {}
         self._harness_last_injected_scope: dict[str, float] = {}
@@ -2124,14 +2335,11 @@ class SessionManager:
         s.last_chat_ts = None
         s.last_chat_history_scanned = False
         s.meta_log_off = int(meta_log_off)
-        s.chat_index_events = []
-        s.chat_index_scan_bytes = 0
-        s.chat_index_scan_complete = False
-        s.chat_index_log_off = int(meta_log_off)
         s.delivery_log_off = int(meta_log_off)
         s.idle_cache_log_off = -1
         s.idle_cache_value = None
         s.queue_idle_since = None
+        s.queue_sending_item_id = None
         s.model_provider = None
         s.preferred_auth_method = None
         s.model = None
@@ -2519,20 +2727,24 @@ class SessionManager:
         obj = json.loads(raw)
         if not isinstance(obj, dict):
             raise ValueError("invalid session_queues.json (expected object)")
-        cleaned: dict[str, list[str]] = {}
+        cleaned: dict[str, list[dict[str, Any]]] = {}
         for sid, arr in obj.items():
             if not isinstance(sid, str) or not sid:
                 continue
             if not isinstance(arr, list):
                 continue
-            out: list[str] = []
+            out: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
             for v in arr:
-                if not isinstance(v, str):
+                item = _coerce_queue_item(v)
+                if item is None:
                     continue
-                t = v.strip()
-                if not t:
-                    continue
-                out.append(v)
+                item_id = str(item["id"])
+                if item_id in seen_ids:
+                    item["id"] = _new_queue_item_id()
+                    item_id = str(item["id"])
+                seen_ids.add(item_id)
+                out.append(item)
             if out:
                 cleaned[sid] = out
         with self._lock:
@@ -2540,7 +2752,11 @@ class SessionManager:
 
     def _save_queues(self) -> None:
         with self._lock:
-            obj = dict(self._queues)
+            obj = {
+                sid: [_copy_queue_item(item) for item in items]
+                for sid, items in self._queues.items()
+                if isinstance(items, list) and items
+            }
         os.makedirs(APP_DIR, exist_ok=True)
         tmp = QUEUE_PATH.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -2643,7 +2859,7 @@ class SessionManager:
             q = qmap.get(session_id)
             return int(len(q)) if isinstance(q, list) else 0
 
-    def _queue_list_local(self, session_id: str) -> list[str]:
+    def _queue_list_local(self, session_id: str) -> list[dict[str, Any]]:
         with self._lock:
             qmap = getattr(self, "_queues", None)
             if not isinstance(qmap, dict):
@@ -2651,12 +2867,20 @@ class SessionManager:
             q = qmap.get(session_id)
             if not isinstance(q, list) or not q:
                 return []
-            return list(q)
+            s = self._sessions.get(session_id)
+            sending_id = s.queue_sending_item_id if s else None
+            out: list[dict[str, Any]] = []
+            for item in q:
+                copied = _copy_queue_item(item)
+                copied["sending"] = bool(sending_id and copied["id"] == sending_id)
+                out.append(copied)
+            return out
 
-    def _queue_enqueue_local(self, session_id: str, text: str) -> dict[str, Any]:
+    def _queue_append_item_local(self, session_id: str, text: str) -> tuple[dict[str, Any], int]:
         t = str(text)
         if not t.strip():
             raise ValueError("text required")
+        item = _new_queue_item(t)
         with self._lock:
             if session_id not in self._sessions:
                 raise KeyError("unknown session")
@@ -2664,45 +2888,183 @@ class SessionManager:
             if not isinstance(q, list):
                 q = []
                 self._queues[session_id] = q
-            q.append(t)
+            q.append(item)
             ql = len(q)
         self._save_queues()
-        return {"queued": True, "queue_len": int(ql)}
+        return _copy_queue_item(item), int(ql)
 
-    def _queue_delete_local(self, session_id: str, index: int) -> dict[str, Any]:
+    def _queue_enqueue_local(self, session_id: str, text: str) -> dict[str, Any]:
+        item, ql = self._queue_append_item_local(session_id, text)
+        return {"queued": True, "queue_len": int(ql), "item": item}
+
+    def _queue_delete_local(self, session_id: str, item_id: str) -> dict[str, Any]:
+        item_id_clean = str(item_id).strip()
+        if not item_id_clean:
+            raise ValueError("id required")
         with self._lock:
             if session_id not in self._sessions:
                 raise KeyError("unknown session")
+            s = self._sessions.get(session_id)
             q = self._queues.get(session_id)
             if not isinstance(q, list):
                 q = []
                 self._queues[session_id] = q
-            if index < 0 or index >= len(q):
-                raise ValueError("index out of range")
-            q.pop(int(index))
+            if s and s.queue_sending_item_id == item_id_clean:
+                raise ValueError("item is already sending")
+            idx = next((i for i, item in enumerate(q) if item.get("id") == item_id_clean), -1)
+            if idx < 0:
+                raise ValueError("item not found")
+            q.pop(idx)
             ql = len(q)
             if not q:
                 self._queues.pop(session_id, None)
         self._save_queues()
         return {"ok": True, "queue_len": int(ql)}
 
-    def _queue_update_local(self, session_id: str, index: int, text: str) -> dict[str, Any]:
+    def _queue_update_local(self, session_id: str, item_id: str, text: str) -> dict[str, Any]:
+        item_id_clean = str(item_id).strip()
         t = str(text)
+        if not item_id_clean:
+            raise ValueError("id required")
         if not t.strip():
             raise ValueError("text required")
         with self._lock:
             if session_id not in self._sessions:
                 raise KeyError("unknown session")
+            s = self._sessions.get(session_id)
             q = self._queues.get(session_id)
             if not isinstance(q, list):
                 q = []
                 self._queues[session_id] = q
-            if index < 0 or index >= len(q):
-                raise ValueError("index out of range")
-            q[int(index)] = t
+            if s and s.queue_sending_item_id == item_id_clean:
+                raise ValueError("item is already sending")
+            idx = next((i for i, item in enumerate(q) if item.get("id") == item_id_clean), -1)
+            if idx < 0:
+                raise ValueError("item not found")
+            q[idx]["text"] = t
+            ql = len(q)
+            item = _copy_queue_item(q[idx])
+        self._save_queues()
+        return {"ok": True, "queue_len": int(ql), "item": item}
+
+    def _queue_move_local(self, session_id: str, item_id: str, to_index: int) -> dict[str, Any]:
+        item_id_clean = str(item_id).strip()
+        if not item_id_clean:
+            raise ValueError("id required")
+        if isinstance(to_index, bool):
+            raise ValueError("to_index must be an integer")
+        target = int(to_index)
+        with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError("unknown session")
+            s = self._sessions.get(session_id)
+            q = self._queues.get(session_id)
+            if not isinstance(q, list):
+                q = []
+                self._queues[session_id] = q
+            if not q:
+                raise ValueError("item not found")
+            idx = next((i for i, item in enumerate(q) if item.get("id") == item_id_clean), -1)
+            if idx < 0:
+                raise ValueError("item not found")
+            sending_id = s.queue_sending_item_id if s else None
+            if sending_id == item_id_clean:
+                raise ValueError("item is already sending")
+            min_index = 1 if sending_id else 0
+            if target < min_index or target >= len(q):
+                raise ValueError("to_index out of range")
+            item = q.pop(idx)
+            q.insert(target, item)
             ql = len(q)
         self._save_queues()
         return {"ok": True, "queue_len": int(ql)}
+
+    def _queue_session_state(self, session_id: str) -> tuple[Session, Path | None]:
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if not s:
+                raise KeyError("unknown session")
+            return s, s.log_path
+
+    def _queue_remote_ready(self, session_id: str, *, log_path: Path | None) -> bool:
+        st = self.get_state(session_id)
+        if not isinstance(st, dict) or "busy" not in st or "queue_len" not in st:
+            raise ValueError("invalid broker state response")
+        if bool(st.get("busy")) or int(st.get("queue_len")) > 0:
+            return False
+        if isinstance(log_path, Path) and log_path.exists() and (not self.idle_from_log(session_id)):
+            return False
+        return True
+
+    def _promote_queue_head_if_sendable(
+        self,
+        session_id: str,
+        *,
+        require_idle_grace: bool,
+        now_ts: float | None = None,
+        expected_item_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if now_ts is None:
+            now_ts = time.time()
+        _session, log_path = self._queue_session_state(session_id)
+        try:
+            ready = self._queue_remote_ready(session_id, log_path=log_path)
+        except Exception:
+            with self._lock:
+                s0 = self._sessions.get(session_id)
+                if s0:
+                    s0.queue_idle_since = None
+            return None
+        with self._lock:
+            s0 = self._sessions.get(session_id)
+            if not s0:
+                return None
+            q = self._queues.get(session_id)
+            if not isinstance(q, list) or not q:
+                s0.queue_idle_since = None
+                return None
+            if s0.queue_sending_item_id is not None:
+                return None
+            head = q[0]
+            head_id = str(head.get("id") or "")
+            if expected_item_id is not None and head_id != expected_item_id:
+                return None
+            if not ready:
+                s0.queue_idle_since = None
+                return None
+            if require_idle_grace:
+                idle_since = s0.queue_idle_since
+                if idle_since is None:
+                    s0.queue_idle_since = float(now_ts)
+                    return None
+                if (float(now_ts) - idle_since) < QUEUE_IDLE_GRACE_SECONDS:
+                    return None
+            s0.queue_idle_since = None
+            s0.queue_sending_item_id = head_id
+            text = str(head.get("text") or "")
+        try:
+            resp = self.send(session_id, text)
+        except Exception:
+            with self._lock:
+                s0 = self._sessions.get(session_id)
+                if s0 and s0.queue_sending_item_id == head_id:
+                    s0.queue_sending_item_id = None
+                    s0.queue_idle_since = None
+            return None
+        with self._lock:
+            s0 = self._sessions.get(session_id)
+            if s0 and s0.queue_sending_item_id == head_id:
+                s0.queue_sending_item_id = None
+                s0.queue_idle_since = None
+            q = self._queues.get(session_id)
+            if isinstance(q, list):
+                idx = next((i for i, item in enumerate(q) if item.get("id") == head_id), -1)
+                if idx >= 0:
+                    q.pop(idx)
+                if not q:
+                    self._queues.pop(session_id, None)
+        self._save_queues()
+        return resp
 
     def _files_key_for_session(self, session_id: str) -> tuple[str, list[str], "Session"]:
         s = self._sessions.get(session_id)
@@ -3003,80 +3365,8 @@ class SessionManager:
             self._stop.wait(QUEUE_SWEEP_SECONDS)
 
     def _maybe_drain_session_queue(self, session_id: str, *, now_ts: float | None = None) -> bool:
-        if now_ts is None:
-            now_ts = time.time()
-        with self._lock:
-            s0 = self._sessions.get(session_id)
-            if not s0:
-                return False
-            q = self._queues.get(session_id)
-            if not isinstance(q, list) or not q:
-                s0.queue_idle_since = None
-                return False
-            text = q[0]
-            log_path = s0.log_path
-        try:
-            st = self.get_state(session_id)
-        except Exception:
-            with self._lock:
-                s0 = self._sessions.get(session_id)
-                if s0:
-                    s0.queue_idle_since = None
-            return False
-        if not isinstance(st, dict) or "busy" not in st or "queue_len" not in st:
-            with self._lock:
-                s0 = self._sessions.get(session_id)
-                if s0:
-                    s0.queue_idle_since = None
-            return False
-        if bool(st.get("busy")) or int(st.get("queue_len")) > 0:
-            with self._lock:
-                s0 = self._sessions.get(session_id)
-                if s0:
-                    s0.queue_idle_since = None
-            return False
-        try:
-            if isinstance(log_path, Path) and log_path.exists() and (not self.idle_from_log(session_id)):
-                with self._lock:
-                    s0 = self._sessions.get(session_id)
-                    if s0:
-                        s0.queue_idle_since = None
-                return False
-        except Exception:
-            with self._lock:
-                s0 = self._sessions.get(session_id)
-                if s0:
-                    s0.queue_idle_since = None
-            return False
-        with self._lock:
-            s0 = self._sessions.get(session_id)
-            if not s0:
-                return False
-            idle_since = s0.queue_idle_since
-            if idle_since is None:
-                s0.queue_idle_since = float(now_ts)
-                return False
-            if (float(now_ts) - idle_since) < QUEUE_IDLE_GRACE_SECONDS:
-                return False
-        try:
-            self.send(session_id, text)
-        except Exception:
-            with self._lock:
-                s0 = self._sessions.get(session_id)
-                if s0:
-                    s0.queue_idle_since = None
-            return False
-        with self._lock:
-            q = self._queues.get(session_id)
-            s0 = self._sessions.get(session_id)
-            if s0:
-                s0.queue_idle_since = None
-            if isinstance(q, list) and q and q[0] == text:
-                q.pop(0)
-                if not q:
-                    self._queues.pop(session_id, None)
-        self._save_queues()
-        return True
+        resp = self._promote_queue_head_if_sendable(session_id, require_idle_grace=True, now_ts=now_ts)
+        return isinstance(resp, dict)
 
     def _queue_sweep(self) -> None:
         self._discover_existing_if_stale()
@@ -3631,132 +3921,6 @@ class SessionManager:
         if self._queue_len(session_id) > 0:
             self._maybe_drain_session_queue(session_id)
 
-    def _set_chat_index_snapshot(
-        self,
-        *,
-        session_id: str,
-        events: list[dict[str, Any]],
-        token_update: dict[str, Any] | None,
-        scan_bytes: int,
-        scan_complete: bool,
-        log_off: int,
-    ) -> None:
-        def event_key(ev: dict[str, Any]) -> tuple[str, int, str] | None:
-            role = ev.get("role")
-            if role not in ("user", "assistant"):
-                return None
-            text = ev.get("text")
-            if not isinstance(text, str):
-                return None
-            ts = ev.get("ts")
-            if not isinstance(ts, (int, float)):
-                return None
-            return role, int(round(float(ts) * 1000.0)), text
-
-        with self._lock:
-            s = self._sessions.get(session_id)
-            if not s:
-                return
-            # Deduplicate to avoid re-appending overlapping tail events across incremental scans.
-            # Also guard against runtimes emitting the same assistant message twice with slightly
-            # different timestamps by deduping assistant text within the current assistant stretch
-            # (resetting when we see a user message).
-            tail = list(events[-CHAT_INDEX_MAX_EVENTS:])
-            uniq_rev: list[dict[str, Any]] = []
-            seen_exact: set[tuple[str, int, str]] = set()
-            seen_assistant_stretch: set[str] = set()
-            for ev in reversed(tail):
-                k = event_key(ev)
-                if k is not None and k in seen_exact:
-                    continue
-                if k is not None:
-                    seen_exact.add(k)
-                role = ev.get("role")
-                if role == "user":
-                    seen_assistant_stretch.clear()
-                elif role == "assistant":
-                    text = ev.get("text")
-                    if isinstance(text, str):
-                        if text in seen_assistant_stretch:
-                            continue
-                        seen_assistant_stretch.add(text)
-                uniq_rev.append(ev)
-            s.chat_index_events = list(reversed(uniq_rev))
-            s.chat_index_scan_bytes = int(scan_bytes)
-            s.chat_index_scan_complete = bool(scan_complete) and (len(events) <= CHAT_INDEX_MAX_EVENTS)
-            s.chat_index_log_off = int(log_off)
-            if token_update is not None:
-                s.token = token_update
-
-    def _append_chat_events(self, session_id: str, new_events: list[dict[str, Any]], *, new_off: int, latest_token: dict[str, Any] | None) -> None:
-        def event_key(ev: dict[str, Any]) -> tuple[str, int, str] | None:
-            role = ev.get("role")
-            if role not in ("user", "assistant"):
-                return None
-            text = ev.get("text")
-            if not isinstance(text, str):
-                return None
-            ts = ev.get("ts")
-            if not isinstance(ts, (int, float)):
-                return None
-            return role, int(round(float(ts) * 1000.0)), text
-
-        if not new_events and latest_token is None:
-            with self._lock:
-                s = self._sessions.get(session_id)
-                if s:
-                    s.chat_index_log_off = int(new_off)
-            return
-        with self._lock:
-            s = self._sessions.get(session_id)
-            if not s:
-                return
-            if new_events:
-                merged = list(s.chat_index_events)
-                recent = merged[-256:] if len(merged) > 256 else merged
-                seen_exact: set[tuple[str, int, str]] = set()
-                for ev in recent:
-                    k = event_key(ev)
-                    if k is not None:
-                        seen_exact.add(k)
-                # Build assistant stretch state from the end of the merged list.
-                # If the current tail already has assistant messages (after the last user),
-                # avoid appending the same assistant text again.
-                assistant_stretch: set[str] = set()
-                for ev in reversed(merged):
-                    role = ev.get("role")
-                    if role == "user":
-                        break
-                    if role == "assistant":
-                        text = ev.get("text")
-                        if isinstance(text, str):
-                            assistant_stretch.add(text)
-                appended: list[dict[str, Any]] = []
-                for ev in new_events:
-                    k = event_key(ev)
-                    if k is not None and k in seen_exact:
-                        continue
-                    if k is not None:
-                        seen_exact.add(k)
-                    role = ev.get("role")
-                    if role == "user":
-                        assistant_stretch.clear()
-                    elif role == "assistant":
-                        text = ev.get("text")
-                        if isinstance(text, str):
-                            if text in assistant_stretch:
-                                continue
-                            assistant_stretch.add(text)
-                    merged.append(ev)
-                    appended.append(ev)
-                if len(merged) > CHAT_INDEX_MAX_EVENTS:
-                    merged = merged[-CHAT_INDEX_MAX_EVENTS:]
-                    s.chat_index_scan_complete = False
-                s.chat_index_events = merged
-            s.chat_index_log_off = int(new_off)
-            if latest_token is not None:
-                s.token = latest_token
-
     def _attach_notification_texts(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         voice_push = getattr(self, "_voice_push", None)
         if voice_push is None:
@@ -3782,120 +3946,8 @@ class SessionManager:
             out.append(ev2)
         return out
 
-    def _ensure_chat_index(self, session_id: str, *, min_events: int, before: int) -> tuple[list[dict[str, Any]], int, bool, int, dict[str, Any] | None]:
-        with self._lock:
-            s = self._sessions.get(session_id)
-            if not s:
-                return [], 0, False, 0, None
-            lp = s.log_path
-            scan_bytes = int(s.chat_index_scan_bytes) if s.chat_index_scan_bytes > 0 else CHAT_INIT_SEED_SCAN_BYTES
-            idx_off = int(s.chat_index_log_off)
-        if lp is None or (not lp.exists()):
-            return [], 0, False, 0, None
-
-        sz = int(lp.stat().st_size)
-
-        if sz < idx_off:
-            idx_off = 0
-            self._set_chat_index_snapshot(
-                session_id=session_id,
-                events=[],
-                token_update=None,
-                scan_bytes=CHAT_INIT_SEED_SCAN_BYTES,
-                scan_complete=False,
-                log_off=0,
-            )
-
-        with self._lock:
-            s2 = self._sessions.get(session_id)
-            ready = bool(s2 and ((s2.chat_index_events is not None)))
-            cached_count = len(s2.chat_index_events) if s2 else 0
-            scan_complete = bool(s2.chat_index_scan_complete) if s2 else False
-
-        target_events = max(0, int(min_events) + max(0, int(before)))
-        if (not ready) or ((target_events > cached_count) and (not scan_complete)):
-            events, token_update, used_scan, complete, log_size = _read_chat_tail_snapshot(
-                lp,
-                min_events=max(20, target_events),
-                initial_scan_bytes=max(CHAT_INIT_SEED_SCAN_BYTES, scan_bytes),
-                max_scan_bytes=CHAT_INIT_MAX_SCAN_BYTES,
-            )
-            self._set_chat_index_snapshot(
-                session_id=session_id,
-                events=events,
-                token_update=token_update,
-                scan_bytes=used_scan,
-                scan_complete=complete,
-                log_off=log_size,
-            )
-
-        with self._lock:
-            s3 = self._sessions.get(session_id)
-            if not s3:
-                return [], 0, False, 0, None
-            lp3 = s3.log_path
-            off3 = int(s3.chat_index_log_off)
-            prev_events = list(s3.chat_index_events)
-        if lp3 is None or (not lp3.exists()):
-            return [], off3, False, 0, None
-
-        sz2 = int(lp3.stat().st_size)
-
-        if sz2 > off3:
-            delta = sz2 - off3
-            if delta >= CHAT_INDEX_RESEED_THRESHOLD_BYTES:
-                events, token_update, used_scan, complete, log_size = _read_chat_tail_snapshot(
-                    lp3,
-                    min_events=max(20, target_events),
-                    initial_scan_bytes=max(CHAT_INIT_SEED_SCAN_BYTES, scan_bytes),
-                    max_scan_bytes=CHAT_INIT_MAX_SCAN_BYTES,
-                )
-                self._set_chat_index_snapshot(
-                    session_id=session_id,
-                    events=events,
-                    token_update=token_update,
-                    scan_bytes=used_scan,
-                    scan_complete=complete,
-                    log_off=log_size,
-                )
-            else:
-                cur = off3
-                loops = 0
-                latest_token: dict[str, Any] | None = None
-                aggregated_events: list[dict[str, Any]] = []
-                while cur < sz2 and loops < 16:
-                    objs, new_off = _read_jsonl_from_offset(lp3, cur, max_bytes=CHAT_INDEX_INCREMENT_BYTES)
-                    if new_off <= cur:
-                        break
-                    _th, _tools, _sys, _last_ts, token_update, new_events = _analyze_log_chunk(objs)
-                    if token_update is not None:
-                        latest_token = token_update
-                    if new_events:
-                        aggregated_events.extend(new_events)
-                    cur = new_off
-                    loops += 1
-                self._append_chat_events(session_id, aggregated_events, new_off=cur, latest_token=latest_token)
-
-        with self._lock:
-            s4 = self._sessions.get(session_id)
-            if not s4:
-                return prev_events, off3, False, 0, None
-            events2 = list(s4.chat_index_events)
-            log_off2 = int(s4.chat_index_log_off)
-            scan_complete2 = bool(s4.chat_index_scan_complete)
-            token2 = s4.token if isinstance(s4.token, dict) or s4.token is None else None
-
-        n = len(events2)
-        b = max(0, int(before))
-        end = max(0, n - b)
-        start = max(0, end - max(20, int(min_events)))
-        page = self._attach_notification_texts(events2[start:end])
-        has_older = (start > 0) or ((not scan_complete2) and bool(page))
-        next_before = b + len(page) if has_older else 0
-        return page, log_off2, has_older, next_before, token2
-
     def mark_log_delta(self, session_id: str, *, objs: list[dict[str, Any]], new_off: int) -> None:
-        _th, _tools, _sys, last_ts, token_update, new_events = _analyze_log_chunk(objs)
+        _th, _tools, _sys, last_ts, token_update, _chat_events = _analyze_log_chunk(objs)
         model = None
         reasoning_effort = None
         for obj in reversed(objs):
@@ -3903,7 +3955,6 @@ class SessionManager:
                 continue
             model, reasoning_effort = _turn_context_run_settings(obj.get("payload"))
             break
-        self._append_chat_events(session_id, new_events, new_off=new_off, latest_token=token_update)
         with self._lock:
             s = self._sessions.get(session_id)
             if s:
@@ -4256,20 +4307,28 @@ class SessionManager:
         return resp
 
     def enqueue(self, session_id: str, text: str) -> dict[str, Any]:
-        # Persist queued messages on the server so they survive broker restarts.
-        return self._queue_enqueue_local(session_id, text)
+        item, ql = self._queue_append_item_local(session_id, text)
+        if ql != 1:
+            return {"queued": True, "queue_len": int(ql), "item": item}
+        resp = self._promote_queue_head_if_sendable(session_id, require_idle_grace=False, expected_item_id=str(item["id"]))
+        if isinstance(resp, dict):
+            return resp
+        return {"queued": True, "queue_len": 1, "item": item}
 
-    def queue_list(self, session_id: str) -> list[str]:
+    def queue_list(self, session_id: str) -> list[dict[str, Any]]:
         with self._lock:
             if session_id not in self._sessions:
                 raise KeyError("unknown session")
         return self._queue_list_local(session_id)
 
-    def queue_delete(self, session_id: str, index: int) -> dict[str, Any]:
-        return self._queue_delete_local(session_id, int(index))
+    def queue_delete(self, session_id: str, item_id: str) -> dict[str, Any]:
+        return self._queue_delete_local(session_id, item_id)
 
-    def queue_update(self, session_id: str, index: int, text: str) -> dict[str, Any]:
-        return self._queue_update_local(session_id, int(index), text)
+    def queue_update(self, session_id: str, item_id: str, text: str) -> dict[str, Any]:
+        return self._queue_update_local(session_id, item_id, text)
+
+    def queue_move(self, session_id: str, item_id: str, to_index: int) -> dict[str, Any]:
+        return self._queue_move_local(session_id, item_id, to_index)
 
     def get_state(self, session_id: str) -> dict[str, Any]:
         with self._lock:
@@ -4369,11 +4428,48 @@ def _read_static_bytes(path: Path) -> bytes:
     data = path.read_bytes()
     if path.suffix != ".html":
         return data
-    placeholder = STATIC_ASSET_VERSION_PLACEHOLDER.encode("ascii")
-    if placeholder not in data:
-        return data
-    version = _static_asset_version(path.parent).encode("ascii")
-    return data.replace(placeholder, version)
+    replacements = {
+        STATIC_ASSET_VERSION_PLACEHOLDER.encode("ascii"): _static_asset_version(path.parent).encode("ascii"),
+        STATIC_ATTACH_MAX_BYTES_PLACEHOLDER.encode("ascii"): str(ATTACH_UPLOAD_MAX_BYTES).encode("ascii"),
+    }
+    for placeholder, value in replacements.items():
+        if placeholder in data:
+            data = data.replace(placeholder, value)
+    return data
+
+
+def _message_runtime_snapshot(
+    session_id: str,
+    s: Session,
+    *,
+    token_update: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool, int, dict[str, Any] | None]:
+    state = MANAGER.get_state(session_id)
+    if not isinstance(state, dict):
+        raise ValueError("invalid broker state response")
+    if "busy" not in state:
+        raise ValueError("missing busy from broker state response")
+    if "queue_len" not in state:
+        raise ValueError("missing queue_len from broker state response")
+    state_busy = bool(state.get("busy"))
+    if s.log_path is not None and s.log_path.exists():
+        idle_val = MANAGER.idle_from_log(session_id)
+        if s.agent_backend == "pi":
+            busy_val = not bool(idle_val)
+        else:
+            busy_val = state_busy or (not bool(idle_val))
+    else:
+        busy_val = False
+    queue_val = MANAGER._queue_len(session_id)
+    token_val: dict[str, Any] | None = None
+    if "token" in state:
+        state_token = state.get("token")
+        if not (isinstance(state_token, dict) or state_token is None):
+            raise ValueError("invalid token from broker state response")
+        token_val = state_token if isinstance(state_token, dict) else (s.token if isinstance(s.token, dict) else None)
+    elif isinstance(token_update, dict):
+        token_val = token_update
+    return state, bool(busy_val), int(queue_val), token_val
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -4730,7 +4826,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except ValueError as e:
                     _json_response(self, 502, {"error": str(e)})
                     return
-                _json_response(self, 200, {"ok": True, "queue": q})
+                _json_response(self, 200, {"ok": True, "items": q, "queue": [str(item.get("text") or "") for item in q]})
                 return
 
             if path.startswith("/api/sessions/") and path.endswith("/file/read"):
@@ -4764,7 +4860,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 400, {"error": "path is not a file"})
                     return
                 try:
-                    kind, size, image_ctype, raw = _read_text_or_image(p)
+                    view = _read_client_file_view(p)
                 except PermissionError as e:
                     _json_response(self, 403, {"error": str(e)})
                     return
@@ -4775,34 +4871,63 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     MANAGER.files_add(session_id, str(p))
                 except KeyError:
                     pass
-                if kind == "image":
+                if view.kind == "image":
                     _json_response(
                         self,
                         200,
                         {
                             "ok": True,
                             "kind": "image",
-                            "content_type": image_ctype,
+                            "content_type": view.content_type,
                             "path": str(p),
                             "rel": str(rel),
-                            "size": int(size),
+                            "size": int(view.size),
                             "image_url": f"/api/sessions/{session_id}/file/blob?path={urllib.parse.quote(rel)}",
                         },
                     )
                     return
-                text, _size2, editable, version = _read_text_file_for_client(p, max_bytes=FILE_READ_MAX_BYTES)
+                if view.kind == "pdf":
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "kind": "pdf",
+                            "content_type": view.content_type,
+                            "path": str(p),
+                            "rel": str(rel),
+                            "size": int(view.size),
+                            "pdf_url": f"/api/sessions/{session_id}/file/blob?path={urllib.parse.quote(rel)}",
+                        },
+                    )
+                    return
+                if view.kind == "download_only":
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "kind": "download_only",
+                            "path": str(p),
+                            "rel": str(rel),
+                            "size": int(view.size),
+                            "reason": view.blocked_reason,
+                            "viewer_max_bytes": view.viewer_max_bytes,
+                        },
+                    )
+                    return
                 _json_response(
                     self,
                     200,
                     {
                         "ok": True,
-                        "kind": "text",
+                        "kind": view.kind,
                         "path": str(p),
                         "rel": str(rel),
-                        "size": int(size),
-                        "text": text,
-                        "editable": bool(editable),
-                        "version": version,
+                        "size": int(view.size),
+                        "text": view.text,
+                        "editable": bool(view.editable),
+                        "version": view.version,
                     },
                 )
                 return
@@ -4927,12 +5052,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 raw = p.read_bytes()
                 _kind, ctype = _file_kind(p, raw)
-                if ctype is None:
-                    _json_response(self, 400, {"error": "file is not a supported image"})
+                if _kind not in {"image", "pdf"} or ctype is None:
+                    _json_response(self, 400, {"error": "file is not previewable inline"})
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{urllib.parse.quote(p.name, safe='')}")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+
+            if path == "/api/files/blob":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                qs = urllib.parse.parse_qs(u.query)
+                path_q = qs.get("path")
+                if not path_q or not path_q[0]:
+                    _json_response(self, 400, {"error": "path required"})
+                    return
+                path_obj = Path(path_q[0]).expanduser().resolve()
+                if not path_obj.exists():
+                    _json_response(self, 404, {"error": "file not found"})
+                    return
+                if not path_obj.is_file():
+                    _json_response(self, 400, {"error": "path is not a file"})
+                    return
+                raw = path_obj.read_bytes()
+                _kind, ctype = _file_kind(path_obj, raw)
+                if _kind not in {"image", "pdf"} or ctype is None:
+                    _json_response(self, 400, {"error": "file is not previewable inline"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{urllib.parse.quote(path_obj.name, safe='')}")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Pragma", "no-cache")
                 self.send_header("Expires", "0")
@@ -5201,16 +5359,139 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
 
-            if path.startswith("/api/sessions/") and path.endswith("/messages"):
+            session_id = _match_session_route(path, "messages", "tail")
+            if session_id is not None:
                 if not _require_auth(self):
                     self._unauthorized()
                     return
                 t0_total = time.perf_counter()
-                parts = path.split("/")
-                if len(parts) < 4:
-                    self.send_error(404)
+                MANAGER.refresh_session_meta(session_id)
+                s = MANAGER.get_session(session_id)
+                if not s:
+                    _json_response(self, 404, {"error": "unknown session"})
                     return
-                session_id = parts[3]
+                qs = urllib.parse.parse_qs(u.query)
+                limit_q = qs.get("limit")
+                if limit_q is None:
+                    limit = 80
+                else:
+                    if not limit_q:
+                        raise ValueError("invalid limit")
+                    limit = int(limit_q[0])
+                limit = max(20, min(200, limit))
+                if s.log_path is None or (not s.log_path.exists()):
+                    _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "thread_id": s.thread_id,
+                            "log_path": None,
+                            "live_cursor": None,
+                            "history_cursor": None,
+                            "events": [],
+                            "has_older": False,
+                            "busy": bool(busy_val),
+                            "queue_len": int(queue_val),
+                            "token": token_val,
+                        },
+                    )
+                    _record_metric("api_messages_init_ms", (time.perf_counter() - t0_total) * 1000.0)
+                    return
+                events, before_byte, after_byte, has_older = _read_chat_tail_page(s.log_path, limit=limit)
+                events = MANAGER._attach_notification_texts(events)
+                live_cursor = _encode_message_cursor(kind="live", session=s, pos=after_byte)
+                history_cursor = _encode_message_cursor(kind="history", session=s, pos=before_byte) if has_older and before_byte > 0 else None
+                _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "thread_id": s.thread_id,
+                        "log_path": str(s.log_path),
+                        "live_cursor": live_cursor,
+                        "history_cursor": history_cursor,
+                        "events": events,
+                        "has_older": bool(has_older),
+                        "busy": bool(busy_val),
+                        "queue_len": int(queue_val),
+                        "token": token_val,
+                    },
+                )
+                _record_metric("api_messages_init_ms", (time.perf_counter() - t0_total) * 1000.0)
+                return
+
+            session_id = _match_session_route(path, "messages", "history")
+            if session_id is not None:
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                MANAGER.refresh_session_meta(session_id)
+                s = MANAGER.get_session(session_id)
+                if not s:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                qs = urllib.parse.parse_qs(u.query)
+                cursor_q = qs.get("cursor")
+                if cursor_q is None or not cursor_q or not cursor_q[0].strip():
+                    _json_response(self, 400, {"error": "cursor required"})
+                    return
+                limit_q = qs.get("limit")
+                if limit_q is None:
+                    limit = 60
+                else:
+                    if not limit_q:
+                        raise ValueError("invalid limit")
+                    limit = int(limit_q[0])
+                limit = max(20, min(200, limit))
+                if s.log_path is None or (not s.log_path.exists()):
+                    _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "thread_id": s.thread_id,
+                            "log_path": None,
+                            "history_cursor": None,
+                            "events": [],
+                            "has_older": False,
+                            "busy": bool(busy_val),
+                            "queue_len": int(queue_val),
+                            "token": token_val,
+                        },
+                    )
+                    return
+                try:
+                    before_byte = _decode_message_cursor(cursor_q[0], kind="history", session=s)
+                except MessageCursorError as e:
+                    _json_response(self, 409, {"error": str(e)})
+                    return
+                events, next_before, has_older = _read_chat_history_page(s.log_path, before_byte=before_byte, limit=limit)
+                events = MANAGER._attach_notification_texts(events)
+                history_cursor = _encode_message_cursor(kind="history", session=s, pos=next_before) if has_older and next_before > 0 else None
+                _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "thread_id": s.thread_id,
+                        "log_path": str(s.log_path),
+                        "history_cursor": history_cursor,
+                        "events": events,
+                        "has_older": bool(has_older),
+                        "busy": bool(busy_val),
+                        "queue_len": int(queue_val),
+                        "token": token_val,
+                    },
+                )
+                return
+
+            session_id = _match_session_route(path, "messages", "live")
+            if session_id is not None:
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                t0_total = time.perf_counter()
                 t0_meta = time.perf_counter()
                 MANAGER.refresh_session_meta(session_id)
                 dt_meta_ms = (time.perf_counter() - t0_meta) * 1000.0
@@ -5219,125 +5500,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 404, {"error": "unknown session"})
                     return
                 qs = urllib.parse.parse_qs(u.query)
-                offset_q = qs.get("offset")
-                if offset_q is None:
-                    offset = 0
-                else:
-                    if not offset_q:
-                        raise ValueError("invalid offset")
-                    offset = int(offset_q[0])
-                if offset < 0:
-                    offset = 0
-                init_q = qs.get("init")
-                init = bool(init_q and init_q[0] == "1")
-                before_q = qs.get("before")
-                if before_q is None:
-                    before = 0
-                else:
-                    if not before_q:
-                        raise ValueError("invalid before")
-                    before = int(before_q[0])
-                before = max(0, before)
+                cursor_q = qs.get("cursor")
+                if cursor_q is None or not cursor_q or not cursor_q[0].strip():
+                    _json_response(self, 400, {"error": "cursor required"})
+                    return
                 if s.log_path is None or (not s.log_path.exists()):
-                    state = MANAGER.get_state(session_id)
-                    if not isinstance(state, dict):
-                        raise ValueError("invalid broker state response")
-                    if "busy" not in state:
-                        raise ValueError("missing busy from broker state response")
-                    if "queue_len" not in state:
-                        raise ValueError("missing queue_len from broker state response")
-                    queue_val = MANAGER._queue_len(session_id)
-                    state_token = state.get("token")
-                    if not (isinstance(state_token, dict) or (state_token is None)):
-                        raise ValueError("invalid token from broker state response")
-                    token_val = state_token
+                    _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
                     _json_response(
                         self,
                         200,
                         {
                             "thread_id": s.thread_id,
                             "log_path": None,
-                            "offset": 0,
+                            "live_cursor": None,
                             "events": [],
                             "meta_delta": {"thinking": 0, "tool": 0, "system": 0},
                             "turn_start": False,
                             "turn_end": False,
                             "turn_aborted": False,
-                            "diag": {"pending_log": True},
-                            # Definition: a session with no associated rollout log is idle.
-                            "busy": False,
+                            "diag": {"pending_log": True, "meta_refresh_ms": round(dt_meta_ms, 3)},
+                            "busy": bool(busy_val),
                             "queue_len": int(queue_val),
                             "token": token_val,
-                            "has_older": False,
-                            "next_before": 0,
                         },
                     )
-                    dt_total_ms = (time.perf_counter() - t0_total) * 1000.0
-                    _record_metric("api_messages_init_ms" if init else "api_messages_poll_ms", dt_total_ms)
+                    _record_metric("api_messages_poll_ms", (time.perf_counter() - t0_total) * 1000.0)
                     return
-
-                if offset == 0:
-                    limit_q = qs.get("limit")
-                    if limit_q is None:
-                        limit = 80
-                    else:
-                        if not limit_q:
-                            raise ValueError("invalid limit")
-                        limit = int(limit_q[0])
-                    limit = max(20, min(200, limit))
-                    t0_index = time.perf_counter()
-                    events, new_off, has_older, next_before, token_update = MANAGER._ensure_chat_index(
-                        session_id,
-                        min_events=limit,
-                        before=before,
-                    )
-                    dt_index_ms = (time.perf_counter() - t0_index) * 1000.0
-                    meta_delta = {"thinking": 0, "tool": 0, "system": 0}
-                    flags = {"turn_start": False, "turn_end": False, "turn_aborted": False}
-                    diag_key = "init_index_ms" if init else "bootstrap_index_ms"
-                    diag = {"tool_names": [], "last_tool": None, diag_key: round(dt_index_ms, 3)}
-                else:
-                    has_older = False
-                    next_before = 0
-                    objs, new_off = _read_jsonl_from_offset(s.log_path, offset)
-                    events, meta_delta, flags, diag = _extract_chat_events(objs)
-                    token_update = _extract_token_update(objs)
-                    MANAGER.mark_log_delta(session_id, objs=objs, new_off=new_off)
-                t0_state = time.perf_counter()
-                state = MANAGER.get_state(session_id)
-                dt_state_ms = (time.perf_counter() - t0_state) * 1000.0
+                try:
+                    after_byte = _decode_message_cursor(cursor_q[0], kind="live", session=s)
+                except MessageCursorError as e:
+                    _json_response(self, 409, {"error": str(e)})
+                    return
+                records, next_after = _read_jsonl_records_from_offset(s.log_path, after_byte)
+                objs = [record.obj for record in records]
+                events, meta_delta, flags, diag = _extract_chat_events(objs)
+                token_update = _extract_token_update(objs)
+                if objs:
+                    MANAGER.mark_log_delta(session_id, objs=objs, new_off=next_after)
                 s2 = MANAGER.get_session(session_id)
                 if token_update is not None and s2 is not None:
                     s2.token = token_update
-                if not isinstance(state, dict):
-                    raise ValueError("invalid broker state response")
-                if "busy" not in state:
-                    raise ValueError("missing busy from broker state response")
-                if "queue_len" not in state:
-                    raise ValueError("missing queue_len from broker state response")
-                state_busy = bool(state.get("busy"))
-                state_queue = int(state.get("queue_len"))
-
-                t0_idle = time.perf_counter()
-                idle_val = MANAGER.idle_from_log(session_id)
-                dt_idle_ms = (time.perf_counter() - t0_idle) * 1000.0
-                diag["idle_from_log_ms"] = round(dt_idle_ms, 3)
-
-                if s.agent_backend == "pi":
-                    busy_val = not bool(idle_val)
-                else:
-                    busy_val = bool(state_busy) or (not bool(idle_val))
-                queue_val = MANAGER._queue_len(session_id)
-
-                token_val: dict[str, Any] | None = None
-                if "token" in state:
-                    state_token = state.get("token")
-                    if not (isinstance(state_token, dict) or (state_token is None)):
-                        raise ValueError("invalid token from broker state response")
-                    token_val = state_token if isinstance(state_token, dict) else (s.token if isinstance(s.token, dict) else None)
-                elif isinstance(token_update, dict):
-                    token_val = token_update
-                diag["state_ms"] = round(dt_state_ms, 3)
+                events = MANAGER._attach_notification_texts(events)
+                live_cursor = _encode_message_cursor(kind="live", session=s, pos=next_after)
+                t0_state = time.perf_counter()
+                _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s, token_update=token_update)
+                diag["state_ms"] = round((time.perf_counter() - t0_state) * 1000.0, 3)
                 diag["meta_refresh_ms"] = round(dt_meta_ms, 3)
                 _json_response(
                     self,
@@ -5345,7 +5552,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     {
                         "thread_id": s.thread_id,
                         "log_path": str(s.log_path),
-                        "offset": new_off,
+                        "live_cursor": live_cursor,
                         "events": events,
                         "meta_delta": meta_delta,
                         "turn_start": bool(flags.get("turn_start")),
@@ -5355,12 +5562,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "busy": bool(busy_val),
                         "queue_len": int(queue_val),
                         "token": token_val,
-                        "has_older": bool(has_older),
-                        "next_before": int(next_before),
                     },
                 )
-                dt_total_ms = (time.perf_counter() - t0_total) * 1000.0
-                _record_metric("api_messages_init_ms" if init else "api_messages_poll_ms", dt_total_ms)
+                _record_metric("api_messages_poll_ms", (time.perf_counter() - t0_total) * 1000.0)
                 return
 
             if path.startswith("/api/sessions/") and path.endswith("/tail"):
@@ -5718,7 +5922,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
                 try:
                     path_obj = _resolve_client_file_path(session_id=session_id, raw_path=path_raw)
-                    kind, size, image_ctype, raw = _read_text_or_image(path_obj)
+                    view = _read_client_file_view(path_obj)
                 except FileNotFoundError as e:
                     _json_response(self, 404, {"error": str(e)})
                     return
@@ -5733,23 +5937,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         MANAGER.files_add(session_id, str(path_obj))
                     except KeyError:
                         pass
-                if kind == "image":
+                if view.kind == "image":
                     _json_response(
                         self,
                         200,
                         {
                             "ok": True,
                             "kind": "image",
-                            "content_type": image_ctype,
+                            "content_type": view.content_type,
                             "path": str(path_obj),
-                            "size": int(size),
+                            "size": int(view.size),
                             "image_url": f"/api/files/blob?path={urllib.parse.quote(str(path_obj))}",
                         },
                     )
                     return
-                assert raw is not None
-                text = raw.decode("utf-8", errors="replace")
-                _json_response(self, 200, {"ok": True, "kind": "text", "path": str(path_obj), "size": int(size), "text": text})
+                if view.kind == "pdf":
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "kind": "pdf",
+                            "content_type": view.content_type,
+                            "path": str(path_obj),
+                            "size": int(view.size),
+                            "pdf_url": f"/api/files/blob?path={urllib.parse.quote(str(path_obj))}",
+                        },
+                    )
+                    return
+                if view.kind == "download_only":
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "kind": "download_only",
+                            "path": str(path_obj),
+                            "size": int(view.size),
+                            "reason": view.blocked_reason,
+                            "viewer_max_bytes": view.viewer_max_bytes,
+                        },
+                    )
+                    return
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "kind": view.kind,
+                        "path": str(path_obj),
+                        "size": int(view.size),
+                        "text": view.text,
+                        "editable": bool(view.editable),
+                        "version": view.version,
+                    },
+                )
                 return
 
             if path == "/api/files/inspect":
@@ -5771,7 +6013,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
                 try:
                     path_obj = _resolve_client_file_path(session_id=session_id, raw_path=path_raw)
-                    size, kind, image_ctype = _inspect_client_path(path_obj)
+                    view = _read_client_file_view(path_obj)
                 except FileNotFoundError as e:
                     _json_response(self, 404, {"error": str(e)})
                     return
@@ -5787,9 +6029,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     {
                         "ok": True,
                         "path": str(path_obj),
-                        "kind": kind,
-                        "content_type": image_ctype,
-                        "size": int(size),
+                        "kind": view.kind,
+                        "content_type": view.content_type,
+                        "size": int(view.size),
+                        "reason": view.blocked_reason,
+                        "viewer_max_bytes": view.viewer_max_bytes,
                     },
                 )
                 return
@@ -5812,12 +6056,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 raw = path_obj.read_bytes()
                 _kind, ctype = _file_kind(path_obj, raw)
-                if ctype is None:
-                    _json_response(self, 400, {"error": "file is not a supported image"})
+                if _kind not in {"image", "pdf"} or ctype is None:
+                    _json_response(self, 400, {"error": "file is not previewable inline"})
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{urllib.parse.quote(path_obj.name, safe='')}")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Pragma", "no-cache")
                 self.send_header("Expires", "0")
@@ -6077,12 +6322,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 obj = json.loads(body_text)
                 if not isinstance(obj, dict):
                     raise ValueError("invalid json body (expected object)")
-                idx = obj.get("index")
-                if not isinstance(idx, int):
-                    _json_response(self, 400, {"error": "index required"})
+                item_id = obj.get("id")
+                if not isinstance(item_id, str) or not item_id.strip():
+                    _json_response(self, 400, {"error": "id required"})
                     return
                 try:
-                    res = MANAGER.queue_delete(session_id, idx)
+                    res = MANAGER.queue_delete(session_id, item_id)
                 except KeyError:
                     _json_response(self, 404, {"error": "unknown session"})
                     return
@@ -6105,16 +6350,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 obj = json.loads(body_text)
                 if not isinstance(obj, dict):
                     raise ValueError("invalid json body (expected object)")
-                idx = obj.get("index")
+                item_id = obj.get("id")
                 text = obj.get("text")
-                if not isinstance(idx, int):
-                    _json_response(self, 400, {"error": "index required"})
+                if not isinstance(item_id, str) or not item_id.strip():
+                    _json_response(self, 400, {"error": "id required"})
                     return
                 if not isinstance(text, str) or not text.strip():
                     _json_response(self, 400, {"error": "text required"})
                     return
                 try:
-                    res = MANAGER.queue_update(session_id, idx, text)
+                    res = MANAGER.queue_update(session_id, item_id, text)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                except ValueError as e:
+                    _json_response(self, 502, {"error": str(e)})
+                    return
+                _json_response(self, 200, res)
+                return
+
+            if path.startswith("/api/sessions/") and path.endswith("/queue/move"):
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                parts = path.split("/")
+                session_id = parts[3] if len(parts) >= 4 else ""
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                item_id = obj.get("id")
+                to_index = obj.get("to_index")
+                if not isinstance(item_id, str) or not item_id.strip():
+                    _json_response(self, 400, {"error": "id required"})
+                    return
+                if not isinstance(to_index, int):
+                    _json_response(self, 400, {"error": "to_index required"})
+                    return
+                try:
+                    res = MANAGER.queue_move(session_id, item_id, to_index)
                 except KeyError:
                     _json_response(self, 404, {"error": "unknown session"})
                     return
@@ -6210,7 +6487,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 parts = path.split("/")
                 session_id = parts[3] if len(parts) >= 4 else ""
-                body = _read_body(self, limit=20 * 1024 * 1024)
+                try:
+                    body = _read_body(self, limit=ATTACH_UPLOAD_BODY_MAX_BYTES)
+                except ValueError:
+                    _json_response(self, 413, {"error": f"file too large (max {ATTACH_UPLOAD_MAX_BYTES} bytes)"})
+                    return
                 body_text = body.decode("utf-8")
                 if not body_text.strip():
                     raise ValueError("empty request body")
@@ -6236,7 +6517,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     out_path = _stage_uploaded_file(session_id, filename, raw)
                 except ValueError as e:
-                    status = 413 if str(e) == "file too large" else 400
+                    status = 413 if str(e).startswith("file too large") else 400
                     _json_response(self, status, {"error": str(e)})
                     return
 

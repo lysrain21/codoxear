@@ -1,8 +1,11 @@
 	      const $ = (q) => document.querySelector(q);
 	      const UI_VERSION = String(window.CODOXEAR_ASSET_VERSION || "dev");
-	      let latestUiVersion = UI_VERSION;
-	      let uiReloadPending = false;
-	      function isTextEntryElement(target) {
+	      const ATTACH_UPLOAD_MAX_BYTES = (() => {
+	        const raw = Number(window.CODOXEAR_ATTACH_MAX_BYTES);
+	        if (!Number.isFinite(raw) || raw <= 0) return 16 * 1024 * 1024;
+	        return Math.max(1, Math.floor(raw));
+	      })();
+      function isTextEntryElement(target) {
 	        const el = target instanceof Element ? target.closest("textarea, input, [contenteditable], [contenteditable=''], [contenteditable='true']") : null;
 	        if (!(el instanceof HTMLElement)) return false;
 	        if (el.tagName !== "INPUT") return true;
@@ -190,15 +193,6 @@
         }
         if (!res.ok) throw Object.assign(new Error(obj.error || "request failed"), { status: res.status, obj });
         return obj;
-      }
-
-      function maybeReloadForUpdatedUi(nextVersion) {
-        const next = String(nextVersion || "").trim();
-        if (!next || uiReloadPending || next === latestUiVersion) return false;
-        latestUiVersion = next;
-        uiReloadPending = true;
-        window.location.reload();
-        return true;
       }
 
       function fmtTs(ts) {
@@ -494,7 +488,10 @@
       }
 
       const CLICKABLE_FILE_EXTENSIONS = new Set([
+        "7z",
         "bash",
+        "bin",
+        "bz2",
         "c",
         "cc",
         "cfg",
@@ -504,6 +501,7 @@
         "csv",
         "gif",
         "go",
+        "gz",
         "h",
         "hpp",
         "html",
@@ -518,6 +516,7 @@
         "jsonl",
         "log",
         "md",
+        "pdf",
         "patch",
         "png",
         "py",
@@ -526,14 +525,18 @@
         "sh",
         "sql",
         "svg",
+        "tar",
+        "tgz",
         "toml",
         "ts",
         "tsx",
         "txt",
         "webp",
         "xml",
+        "xz",
         "yaml",
         "yml",
+        "zip",
         "zsh",
       ]);
 
@@ -553,6 +556,23 @@
         const n = Number(value);
         if (!Number.isFinite(n) || n <= 0) return null;
         return Math.max(1, Math.floor(n));
+      }
+
+      function isTextFileKind(kind) {
+        return kind === "text" || kind === "markdown";
+      }
+
+      function isDiffableFileKind(kind) {
+        return isTextFileKind(kind);
+      }
+
+      function blockedFileMessage(rel, reason, viewerMaxBytes, size) {
+        const name = String(rel || "file");
+        if (reason === "too_large") {
+          const maxText = viewerMaxBytes ? fmtBytes(viewerMaxBytes) : "the viewer limit";
+          return `${name} is ${fmtBytes(size)}. The viewer refuses to render text beyond ${maxText}. Use Download instead.`;
+        }
+        return `${name} is not renderable as text, markdown, image, or PDF. Use Download instead.`;
       }
 
       function formatPriorityOffset(value) {
@@ -1236,12 +1256,11 @@
         chatWrap.appendChild(jumpBtn);
         const composer = el("div", { class: "composer" });
 
-	        let selected = null;
-        let offset = 0;
+        let selected = null;
+        let liveCursor = null;
         const INIT_PAGE_LIMIT_DESKTOP = 60;
         const INIT_PAGE_LIMIT_MOBILE = 24;
         const OLDER_PAGE_LIMIT = 60;
-        const CACHE_LIMIT = 40;
         const CHAT_DOM_WINDOW = 260;
         const CHAT_DOM_WINDOW_WITH_HISTORY_SLACK = CHAT_DOM_WINDOW + OLDER_PAGE_LIMIT;
         const OLDER_TOP_TRIGGER_PX = 1;
@@ -1249,7 +1268,7 @@
         let activeLogPath = null;
         let activeThreadId = null;
         let activeFileLine = null;
-        let olderBefore = 0;
+        let historyCursor = null;
         let hasOlder = false;
         let loadingOlder = false;
         let olderLoadRequestId = 0;
@@ -1263,15 +1282,13 @@
 	        let pollFastUntilMs = 0;
 	         let turnOpen = false;
 	         let sessionsTimer = null;
-	         let currentRunning = false;
-	         let openSwipeContent = null;
-	         let openSwipeSessionId = null;
-	         let openSwipeTargetX = 0;
-	         let swipeRefreshDeferred = false;
-	        const cacheBySession = new Map();
-        const cacheLoaded = new Set();
-        const cacheSaveTimers = new Map();
+         let currentRunning = false;
+         let openSwipeContent = null;
+         let openSwipeSessionId = null;
+         let openSwipeTargetX = 0;
+         let swipeRefreshDeferred = false;
 	        let sessionIndex = new Map(); // session_id -> session info
+        const sessionTailCache = new Map();
         let recentCwds = [];
 	        let sending = false;
 	        let localEchoSeq = 0;
@@ -1338,6 +1355,7 @@
         })();
         let announcementHeartbeatTimer = null;
         let liveAudioRetryTimer = null;
+        let liveAudioWatchdogTimer = null;
         let notificationState = {
           desktop_supported: false,
           push_supported: false,
@@ -1348,11 +1366,19 @@
           subscriptions: [],
         };
         let liveAudioStarted = false;
+        let liveAudioSourceUrl = "";
+        let liveAudioHls = null;
+        let liveAudioLastProgressTs = 0;
+        let liveAudioLastCurrentTime = 0;
+        let liveAudioSuspectSinceTs = 0;
+        let liveAudioLastRestartTs = 0;
+        const LIVE_AUDIO_WATCHDOG_MS = 2500;
+        const LIVE_AUDIO_STALL_GRACE_MS = 12000;
+        const LIVE_AUDIO_RESTART_THROTTLE_MS = 4000;
         let swRegistration = null;
          const recentEventKeys = [];
          const recentEventKeySet = new Set();
          const RECENT_EVENT_KEYS_MAX = 320;
-         let lastAssistantKey = "";
                  let clickLoadT0 = 0;
                  let clickMetricPending = false;
               let harnessMenuOpen = false;
@@ -1646,6 +1672,7 @@
         ]);
         const fileDiff = el("div", { class: "fileDiff", id: "fileDiff" });
         const fileImage = el("img", { id: "fileImage", class: "fileImage", alt: "" });
+        const filePdf = el("iframe", { id: "filePdf", class: "filePdf", title: "PDF preview" });
         const fileViewer = el("div", { class: "fileViewer", id: "fileViewer", role: "dialog", "aria-label": "File viewer" }, [
           el("div", { class: "fileViewerHeader" }, [
             el("div", { class: "title", text: "View file" }),
@@ -1655,6 +1682,7 @@
           fileStatus,
           fileDiff,
           fileImage,
+          filePdf,
           fileTouchToolbar,
         ]);
         root.appendChild(fileBackdrop);
@@ -2257,20 +2285,16 @@
         function resetChatRenderState() {
           invalidateOlderLoad();
           autoScroll = true;
-          pendingUser.length = 0;
           sending = false;
-          localEchoSeq = 0;
           recentEventKeys.length = 0;
           recentEventKeySet.clear();
-          lastAssistantKey = "";
-          olderBefore = 0;
+          liveCursor = null;
+          historyCursor = null;
           hasOlder = false;
           loadingOlder = false;
           olderAutoTriggerAt = 0;
               clickMetricPending = false;
-		          chatInner.innerHTML = "";
-	          chatInner.appendChild(olderWrap);
-	          chatInner.appendChild(bottomSentinel);
+          clearTranscriptDom();
               setOlderState({ hasMore: false, isLoading: false });
 	          typingRow = null;
 	          jumpBtn.style.display = "none";
@@ -2279,6 +2303,12 @@
 	          lastScrollTop = 0;
 	          chat.scrollTop = 0;
 	        }
+
+        function clearTranscriptDom() {
+          chatInner.innerHTML = "";
+          chatInner.appendChild(olderWrap);
+          chatInner.appendChild(bottomSentinel);
+        }
 
         function setOlderState({ hasMore, isLoading }) {
           hasOlder = Boolean(hasMore);
@@ -2296,197 +2326,83 @@
           return OLDER_PAGE_LIMIT;
         }
 
-        function cacheStorageKey(sid) {
-          return `codexweb.cache.v5.${sid}`;
-        }
-
-        function normalizeCacheEvent(ev) {
+        function normalizeTailEvent(ev) {
           if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return null;
           if (typeof ev.text !== "string" || !ev.text.trim()) return null;
           const out = { role: ev.role, text: ev.text };
           if (typeof ev.ts === "number" && Number.isFinite(ev.ts)) out.ts = ev.ts;
+          if (typeof ev.message_class === "string") out.message_class = ev.message_class;
+          if (typeof ev.message_id === "string") out.message_id = ev.message_id;
+          if (typeof ev.notification_text === "string") out.notification_text = ev.notification_text;
           return out;
         }
 
-        function assistantTextKey(ev) {
-          if (!ev || ev.role !== "assistant") return "";
-          if (typeof ev.text !== "string") return "";
-          return pendingMatchKey(ev.text);
-        }
-
-        function isAdjacentAssistantDuplicate(prev, ev) {
-          if (!prev || !ev) return false;
-          if (prev.role !== "assistant" || ev.role !== "assistant") return false;
-          const a = assistantTextKey(prev);
-          if (!a) return false;
-          return a === assistantTextKey(ev);
-        }
-
-        function dedupeAdjacentAssistantDuplicates(events) {
-          const out = [];
-          for (const ev of events || []) {
-            const prev = out.length ? out[out.length - 1] : null;
-            if (isAdjacentAssistantDuplicate(prev, ev)) continue;
-            out.push(ev);
-          }
-          return out;
-        }
-
-        function loadCacheFromStorage(sid) {
-          if (!sid || cacheLoaded.has(sid)) return;
-          cacheLoaded.add(sid);
-          try {
-            const raw = localStorage.getItem(cacheStorageKey(sid));
-            if (!raw) return;
-            const obj = JSON.parse(raw);
-            if (!obj || typeof obj !== "object") return;
-            const eventsIn = Array.isArray(obj.events) ? obj.events : [];
-            const events = [];
-            for (const ev of eventsIn) {
-              const norm = normalizeCacheEvent(ev);
-              if (norm) events.push(norm);
-            }
-            if (!events.length) return;
-            const deduped = dedupeAdjacentAssistantDuplicates(events);
-            const cacheChanged = deduped.length !== events.length;
-            if (cacheChanged) {
-              events.length = 0;
-              events.push(...deduped);
-            }
-            if (events.length > CACHE_LIMIT) events.splice(0, events.length - CACHE_LIMIT);
-            const cache = {
-              thread_id: typeof obj.thread_id === "string" ? obj.thread_id : null,
-              log_path: typeof obj.log_path === "string" ? obj.log_path : null,
-              offset: Number(obj.offset) || 0,
-              older_before: Number(obj.older_before) || 0,
-              has_older: Boolean(obj.has_older),
-              events,
-            };
-            cacheBySession.set(sid, cache);
-            if (cacheChanged) scheduleCacheSave(sid);
-          } catch {
-            // ignore corrupted cache
-          }
-        }
-
-        function getCache(sid) {
-          if (!sid) return null;
-          loadCacheFromStorage(sid);
-          return cacheBySession.get(sid) || null;
-        }
-
-        function saveCacheNow(sid) {
-          if (!sid) return;
-          const cache = cacheBySession.get(sid);
-          if (!cache) {
-            localStorage.removeItem(cacheStorageKey(sid));
-            return;
-          }
-          const payload = {
-            thread_id: typeof cache.thread_id === "string" ? cache.thread_id : null,
-            log_path: cache.log_path || null,
-            offset: Number(cache.offset) || 0,
-            older_before: Number(cache.older_before) || 0,
-            has_older: Boolean(cache.has_older),
-            events: Array.isArray(cache.events) ? cache.events : [],
-          };
-          try {
-            localStorage.setItem(cacheStorageKey(sid), JSON.stringify(payload));
-          } catch {
-            // ignore quota issues
-          }
-        }
-
-        function scheduleCacheSave(sid) {
-          if (!sid) return;
-          const existing = cacheSaveTimers.get(sid);
-          if (existing) clearTimeout(existing);
-          const t = setTimeout(() => {
-            cacheSaveTimers.delete(sid);
-            saveCacheNow(sid);
-          }, 400);
-          cacheSaveTimers.set(sid, t);
-        }
-
-        function setCacheMeta(sid, { threadId, logPath, offset: off, olderBefore, hasOlder } = {}) {
-          if (!sid) return;
-          const cache =
-            getCache(sid) || { thread_id: null, log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
-          const nextThreadId =
-            threadId === undefined ? (typeof cache.thread_id === "string" ? cache.thread_id : null) : threadId || null;
-          const nextLogPath =
-            logPath === undefined ? (typeof cache.log_path === "string" ? cache.log_path : null) : logPath || null;
-          const identityChanged =
-            (typeof cache.thread_id === "string" ? cache.thread_id : null) !== nextThreadId ||
-            (typeof cache.log_path === "string" ? cache.log_path : null) !== nextLogPath;
-          if (identityChanged) {
-            cache.events = [];
-            cache.offset = 0;
-            cache.older_before = 0;
-            cache.has_older = false;
-          }
-          if (threadId !== undefined) cache.thread_id = nextThreadId;
-          if (logPath !== undefined) cache.log_path = logPath || null;
-          if (typeof off === "number" && Number.isFinite(off)) cache.offset = off;
-          if (typeof olderBefore === "number" && Number.isFinite(olderBefore)) cache.older_before = olderBefore;
-          if (typeof hasOlder === "boolean") cache.has_older = hasOlder;
-          cacheBySession.set(sid, cache);
-          scheduleCacheSave(sid);
-        }
-
-        function cacheMatchesSession(cache, session) {
+        function tailCacheMatchesSession(cache, session) {
           if (!cache || !session) return false;
-          const cacheThreadId = typeof cache.thread_id === "string" ? cache.thread_id : null;
-          const cacheLogPath = typeof cache.log_path === "string" ? cache.log_path : null;
+          const cacheThreadId = typeof cache.threadId === "string" ? cache.threadId : null;
+          const cacheLogPath = typeof cache.logPath === "string" ? cache.logPath : null;
           const sessionThreadId = typeof session.thread_id === "string" ? session.thread_id : null;
           const sessionLogPath = typeof session.log_path === "string" ? session.log_path : null;
-          if (cacheThreadId !== sessionThreadId) return false;
-          return cacheLogPath === sessionLogPath;
+          return cacheThreadId === sessionThreadId && cacheLogPath === sessionLogPath;
         }
 
-        function replaceCacheEvents(sid, events) {
-          if (!sid) return;
-          const cache =
-            getCache(sid) || { log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
-          const out = [];
-          for (const ev of events || []) {
-            const norm = normalizeCacheEvent(ev);
-            if (!norm) continue;
-            const prev = out.length ? out[out.length - 1] : null;
-            if (isAdjacentAssistantDuplicate(prev, norm)) continue;
-            out.push(norm);
+        function rememberTailSnapshot(sessionId, session, data) {
+          if (!sessionId || !session || !data || typeof data !== "object") return;
+          const events = [];
+          for (const ev of Array.isArray(data.events) ? data.events : []) {
+            const norm = normalizeTailEvent(ev);
+            if (norm) events.push(norm);
           }
-          if (out.length > CACHE_LIMIT) out.splice(0, out.length - CACHE_LIMIT);
-          cache.events = out;
-          cacheBySession.set(sid, cache);
-          scheduleCacheSave(sid);
+          const maxEvents = Math.max(INIT_PAGE_LIMIT_DESKTOP, INIT_PAGE_LIMIT_MOBILE);
+          if (events.length > maxEvents) events.splice(0, events.length - maxEvents);
+          sessionTailCache.set(sessionId, {
+            threadId: typeof session.thread_id === "string" ? session.thread_id : null,
+            logPath: typeof session.log_path === "string" ? session.log_path : null,
+            liveCursor: typeof data.live_cursor === "string" && data.live_cursor ? data.live_cursor : null,
+            historyCursor: typeof data.history_cursor === "string" && data.history_cursor ? data.history_cursor : null,
+            hasOlder: Boolean(data.has_older),
+            busy: Boolean(data.busy),
+            queueLen: Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0,
+            token: data.token || null,
+            events,
+          });
         }
 
-        function appendCacheEvents(sid, events) {
-          if (!sid || !events || !events.length) return;
-          const cache =
-            getCache(sid) || { log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
-          const list = Array.isArray(cache.events) ? cache.events : [];
-          let prev = list.length ? list[list.length - 1] : null;
+        function appendTailSnapshotEvents(sessionId, events, { session = null, liveCursor: nextLiveCursor, busy, queueLen, token } = {}) {
+          if (!sessionId || !events || !events.length) return;
+          const current = sessionTailCache.get(sessionId);
+          const list = current && Array.isArray(current.events) ? current.events.slice() : [];
           for (const ev of events) {
-            const norm = normalizeCacheEvent(ev);
+            const norm = normalizeTailEvent(ev);
             if (!norm) continue;
-            if (isAdjacentAssistantDuplicate(prev, norm)) continue;
             list.push(norm);
-            prev = norm;
           }
-          if (list.length > CACHE_LIMIT) list.splice(0, list.length - CACHE_LIMIT);
-          cache.events = list;
-          cacheBySession.set(sid, cache);
-          scheduleCacheSave(sid);
+          const maxEvents = Math.max(INIT_PAGE_LIMIT_DESKTOP, INIT_PAGE_LIMIT_MOBILE);
+          if (list.length > maxEvents) list.splice(0, list.length - maxEvents);
+          const meta = session || sessionIndex.get(sessionId) || null;
+          sessionTailCache.set(sessionId, {
+            threadId: meta && typeof meta.thread_id === "string" ? meta.thread_id : current ? current.threadId : null,
+            logPath: meta && typeof meta.log_path === "string" ? meta.log_path : current ? current.logPath : null,
+            liveCursor: typeof nextLiveCursor === "string" && nextLiveCursor ? nextLiveCursor : current ? current.liveCursor : null,
+            historyCursor: current ? current.historyCursor : null,
+            hasOlder: current ? Boolean(current.hasOlder) : false,
+            busy: typeof busy === "boolean" ? busy : current ? Boolean(current.busy) : false,
+            queueLen: Number.isFinite(Number(queueLen)) ? Number(queueLen) : current ? Number(current.queueLen || 0) : 0,
+            token: token !== undefined ? token : current ? current.token : null,
+            events: list,
+          });
         }
 
-        function clearCache(sid) {
-          if (!sid) return;
-          cacheBySession.delete(sid);
-          cacheLoaded.delete(sid);
-          cacheSaveTimers.delete(sid);
-          localStorage.removeItem(cacheStorageKey(sid));
+        function restorePendingUserRowsForSession(sessionId) {
+          if (!sessionId) return;
+          const items = pendingUser
+            .filter((item) => item && item.sessionId === sessionId)
+            .sort((a, b) => Number(a.t0 || 0) - Number(b.t0 || 0));
+          for (const item of items) {
+            if (!item || !item.id) continue;
+            if (chatInner.querySelector(`.msg.user[data-local-id="${item.id}"]`)) continue;
+            appendEvent({ role: "user", text: item.text, pending: true, localId: item.id, ts: item.t0 });
+          }
         }
 
         function updateQueueBadge() {
@@ -2768,6 +2684,34 @@
           return { row, bubble };
         }
 
+        function safeMakeRow(ev, opts) {
+          try {
+            return makeRow(ev, opts);
+          } catch (err) {
+            console.error("makeRow failed", err);
+            const role = ev && ev.role === "user" ? "user" : "assistant";
+            const ts = opts && typeof opts.ts === "number" && Number.isFinite(opts.ts) ? opts.ts : null;
+            const pending = Boolean(opts && opts.pending);
+            const row = el("div", { class: `msg-row ${role}` });
+            row.dataset.role = role;
+            if (ts !== null) row.dataset.ts = String(ts);
+            const bubble = el("div", { class: role === "user" ? "msg user" : "msg assistant" });
+            const md = el("div", { class: "md" });
+            md.textContent = typeof ev?.text === "string" ? ev.text : String(ev?.text ?? "");
+            bubble.appendChild(md);
+            if (ts !== null) bubble.appendChild(el("div", { class: "ts", text: time24(new Date(ts * 1000)) }));
+            if (pending) {
+              bubble.style.opacity = "0.72";
+              bubble.setAttribute("data-pending", "1");
+              if (ev && ev.localId) bubble.setAttribute("data-local-id", String(ev.localId));
+            }
+            const shell = el("div", { class: `msg-shell ${role}` });
+            shell.appendChild(bubble);
+            row.appendChild(shell);
+            return { row, bubble };
+          }
+        }
+
       function normalizeTextForPendingMatch(s) {
         // Normalize common platform newline differences to improve pending->ack reconciliation.
         return String(s || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -2807,7 +2751,7 @@
           return t.replace(/[ \t]+$/gm, "").replace(/\s+$/, "");
         }
 
-        function consumePendingUserIfMatches(ev) {
+        function consumePendingUserIfMatches(ev, sessionId = selected) {
           if (ev.role !== "user" || ev.pending) return false;
           const key = pendingMatchKey(ev.text);
           const loose = normalizeTextForPendingMatch(ev.text);
@@ -2815,6 +2759,7 @@
           const candidates = [];
           for (let i = 0; i < pendingUser.length; i++) {
             const x = pendingUser[i];
+            if (!x || x.sessionId !== sessionId) continue;
             if (x.key === key || x.loose === loose) candidates.push({ i, x });
           }
           if (!candidates.length) return false;
@@ -2848,9 +2793,6 @@
           const tsEl = pendingEl.querySelector(".ts");
           if (tsEl && typeof ev.ts === "number" && Number.isFinite(ev.ts)) tsEl.textContent = time24(new Date(ev.ts * 1000));
           rebuildDecorations({ preserveScroll: true });
-          if (selected) {
-            appendCacheEvents(selected, [ev]);
-          }
           markEventSeen(ev);
           return true;
         }
@@ -2893,7 +2835,6 @@
 
 	         async function refreshSessions() {
 	           const data = await api("/api/sessions");
-          if (maybeReloadForUpdatedUi(data && data.app_version)) return latestSessions;
           latestSessions = Array.isArray(data.sessions) ? data.sessions.slice() : [];
           newSessionDefaults =
             data && typeof data.new_session_defaults === "object" && data.new_session_defaults
@@ -2973,16 +2914,16 @@
                  e.preventDefault();
                  e.stopPropagation();
                }
-               closeOpenSwipe();
-               if (!confirm("Delete this session?")) return;
-               try {
-                 await api(`/api/sessions/${s.session_id}/delete`, { method: "POST", body: {} });
-                 clearCache(s.session_id);
-                 if (selected === s.session_id) {
-                   selected = null;
-                   offset = 0;
+              closeOpenSwipe();
+              if (!confirm("Delete this session?")) return;
+              try {
+                await api(`/api/sessions/${s.session_id}/delete`, { method: "POST", body: {} });
+                if (selected === s.session_id) {
+                  selected = null;
                    activeLogPath = null;
                    activeThreadId = null;
+                   liveCursor = null;
+                   historyCursor = null;
                    turnOpen = false;
                    localStorage.removeItem("codexweb.selected");
                    setSessionHash("");
@@ -3210,26 +3151,7 @@
 	            openSwipeTargetX = 0;
 	            openSwipeContent = null;
 	          }
-          if (selected && !sessionIndex.has(selected)) {
-            selected = null;
-            offset = 0;
-            activeLogPath = null;
-            activeThreadId = null;
-            pollGen += 1;
-            if (pollTimer) clearTimeout(pollTimer);
-            pollTimer = null;
-            pollKickPending = false;
-            localStorage.removeItem("codexweb.selected");
-            setSessionHash("");
-            titleLabel.textContent = "No session selected";
-            setStatus({ running: false, queueLen: 0 });
-            setTyping(false);
-            resetChatRenderState();
-            turnOpen = false;
-            if (harnessMenuOpen) hideHarnessMenu();
-            updateHarnessBtnState();
-            updateQueueBadge();
-          } else if (selected) {
+          if (selected) {
             const s = sessionIndex.get(selected);
             if (s) titleLabel.textContent = sessionTitleWithId(s);
           }
@@ -3241,31 +3163,51 @@
         function appendEvent(ev) {
           if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return;
           if (consumePendingUserIfMatches(ev)) return;
-          if (!ev.pending && ev.role === "assistant") {
-            const k = assistantTextKey(ev);
-            if (k && k === lastAssistantKey) return;
-          }
           if (isDuplicateEvent(ev)) return;
 
           const stick = autoScroll || isNearBottom();
           const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : ev.pending ? Date.now() / 1000 : null;
-           const { row } = makeRow(ev, { ts, pending: Boolean(ev.pending) });
+           const { row } = safeMakeRow(ev, { ts, pending: Boolean(ev.pending) });
 	          const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
 	          chatInner.insertBefore(row, anchor);
             trimRenderedRows({ fromTop: true });
           rebuildDecorations({ preserveScroll: false });
             if (!ev.pending) markClickFirstPaint();
-            if (!ev.pending && selected) {
-              appendCacheEvents(selected, [ev]);
-            }
           markEventSeen(ev);
 
           if (stick) {
             requestAnimationFrame(() => scrollToBottom());
           }
           syncJumpButton();
-          if (ev.role === "user") lastAssistantKey = "";
-          else if (!ev.pending && ev.role === "assistant") lastAssistantKey = assistantTextKey(ev) || "";
+        }
+
+        function renderTranscript(events, { preserveScroll = false } = {}) {
+          const msgs = [];
+          const seen = new Set();
+          for (const ev of events || []) {
+            if (!ev || (ev.role !== "user" && ev.role !== "assistant")) continue;
+            if (consumePendingUserIfMatches(ev)) continue;
+            const k = eventKey(ev);
+            if (k && seen.has(k)) continue;
+            if (k) seen.add(k);
+            msgs.push(ev);
+          }
+          clearTranscriptDom();
+          if (!msgs.length) {
+            restorePendingUserRowsForSession(selected);
+            return;
+          }
+          recentEventKeys.length = 0;
+          recentEventKeySet.clear();
+          const frag = document.createDocumentFragment();
+          for (const ev of msgs) {
+            const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
+            markEventSeen(ev);
+            frag.appendChild(safeMakeRow(ev, { ts, pending: false }).row);
+          }
+          chatInner.insertBefore(frag, bottomSentinel);
+          rebuildDecorations({ preserveScroll });
+          restorePendingUserRowsForSession(selected);
         }
 
         function prependOlderEvents(allEvents, { preserveViewport = false } = {}) {
@@ -3279,7 +3221,7 @@
           const frag = document.createDocumentFragment();
           for (const ev of msgs) {
             const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
-            frag.appendChild(makeRow(ev, { ts, pending: false }).row);
+            frag.appendChild(safeMakeRow(ev, { ts, pending: false }).row);
           }
           const anchorRow = preserveViewport ? firstVisibleMessageRow() : null;
           const anchorOffset = anchorRow ? anchorRow.offsetTop - chat.scrollTop : 0;
@@ -3313,20 +3255,23 @@
           olderLoadController = ctl;
           setOlderState({ hasMore: hasOlder, isLoading: true });
           try {
-            const reqBefore = Math.max(0, Number(olderBefore) || 0);
-            const data = await api(`/api/sessions/${sid}/messages?offset=0&init=1&limit=${olderPageLimit()}&before=${reqBefore}`, {
+            if (!historyCursor) throw new Error("history cursor missing");
+            const reqCursor = historyCursor;
+            const data = await api(`/api/sessions/${sid}/messages/history?cursor=${encodeURIComponent(reqCursor)}&limit=${olderPageLimit()}`, {
               signal: ctl.signal,
             });
             if (selected !== sid || pollGen !== gen || reqId !== olderLoadRequestId) return;
             const evs = Array.isArray(data.events) ? data.events : [];
-            const nextBefore = Number.isFinite(Number(data.next_before)) ? Number(data.next_before) : reqBefore;
             const nextHasOlder = Boolean(data.has_older);
             setOlderState({ hasMore: nextHasOlder, isLoading: false });
             if (evs.length) prependOlderEvents(evs, { preserveViewport: auto });
-            olderBefore = nextBefore;
-            setCacheMeta(sid, { olderBefore, hasOlder: nextHasOlder });
-          } catch {
+            historyCursor = typeof data.history_cursor === "string" && data.history_cursor ? data.history_cursor : null;
+          } catch (e) {
             if (selected !== sid || pollGen !== gen || reqId !== olderLoadRequestId) return;
+            if (e && e.status === 409) {
+              await openSession(sid, { useCache: false });
+              return;
+            }
             setOlderState({ hasMore: hasOlder, isLoading: false });
           } finally {
             if (olderLoadController === ctl) olderLoadController = null;
@@ -3338,75 +3283,113 @@
           void loadOlderMessages({ auto: true });
         }
 
-       function startInitialRender(allEvents) {
-         backfillToken += 1;
-         const myToken = backfillToken;
+        function applySessionRuntimeFromTail(sessionId, data) {
+          activeLogPath = data && typeof data.log_path === "string" ? data.log_path : null;
+          activeThreadId = data && typeof data.thread_id === "string" ? data.thread_id : null;
+          liveCursor = typeof data.live_cursor === "string" && data.live_cursor ? data.live_cursor : null;
+          historyCursor = typeof data.history_cursor === "string" && data.history_cursor ? data.history_cursor : null;
+          setOlderState({ hasMore: Boolean(data && data.has_older), isLoading: false });
+          const nowBusy = Boolean(data && data.busy);
+          turnOpen = nowBusy;
+          const queueLen = data && Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0;
+          setStatus({ running: nowBusy, queueLen });
+          setContext(data ? data.token : null);
+          setTyping(nowBusy);
+          const s = sessionIndex.get(sessionId);
+          if (s) rememberTailSnapshot(sessionId, s, data);
+        }
 
-         // Guardrail: startInitialRender is intended to backfill an empty chat view.
-         // If it is invoked again (e.g., due to a race), clear existing rendered rows
-         // to avoid duplicating the last assistant message.
-         if (chatInner.querySelector(".msg-row:not(.typing-row)")) {
-           for (const n of Array.from(chatInner.querySelectorAll(".day-sep"))) n.remove();
-           for (const n of Array.from(chatInner.querySelectorAll(".msg-row:not(.typing-row)"))) n.remove();
-         }
+        function renderSessionTail(events) {
+          renderTranscript(events, { preserveScroll: false });
+          markClickFirstPaint();
+          requestAnimationFrame(() => {
+            scrollToBottom();
+            requestAnimationFrame(() => scrollToBottom());
+          });
+        }
 
-         const msgs = [];
-         const initDedup = new Set();
-         for (const ev of allEvents) {
-               if (!ev || (ev.role !== "user" && ev.role !== "assistant")) continue;
-               if (consumePendingUserIfMatches(ev)) continue;
-             const k = eventKey(ev);
-             if (k && initDedup.has(k)) continue;
-             if (k) initDedup.add(k);
-             const prev = msgs.length ? msgs[msgs.length - 1] : null;
-             if (isAdjacentAssistantDuplicate(prev, ev)) continue;
-               msgs.push(ev);
-         }
-           if (!msgs.length) return;
-           lastAssistantKey = "";
-           for (let i = msgs.length - 1; i >= 0; i--) {
-             const ev = msgs[i];
-             if (!ev) continue;
-             if (ev.role === "user") break;
-             if (ev.role === "assistant") {
-               lastAssistantKey = assistantTextKey(ev) || "";
-               break;
-             }
-           }
-           if (selected) replaceCacheEvents(selected, msgs);
-           recentEventKeys.length = 0;
-           recentEventKeySet.clear();
-           for (const ev of msgs) {
-             markEventSeen(ev);
+        function applyCachedTail(sessionId, cache, sessionMeta) {
+          activeLogPath = cache.logPath || null;
+          activeThreadId = cache.threadId || null;
+          liveCursor = cache.liveCursor || null;
+          historyCursor = cache.historyCursor || null;
+          setOlderState({ hasMore: Boolean(cache.hasOlder), isLoading: false });
+          renderSessionTail(cache.events);
+          const metaBusy = Boolean(sessionMeta && sessionMeta.busy);
+          const cachedBusy = Boolean(cache.busy) || metaBusy;
+          const queueLen =
+            sessionMeta && Number.isFinite(Number(sessionMeta.queue_len))
+              ? Number(sessionMeta.queue_len)
+              : Number.isFinite(Number(cache.queueLen))
+                ? Number(cache.queueLen)
+                : 0;
+          turnOpen = cachedBusy;
+          setStatus({ running: cachedBusy, queueLen });
+          setContext(cache.token || (sessionMeta ? sessionMeta.token : null));
+          setTyping(cachedBusy);
+        }
+
+        async function openSession(sessionId, { useCache = true } = {}) {
+          pollGen += 1;
+          const myGen = pollGen;
+          if (pollTimer) {
+            clearTimeout(pollTimer);
+            pollTimer = null;
           }
-	          const frag = document.createDocumentFragment();
-          for (const ev of msgs) {
-            const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
-            frag.appendChild(makeRow(ev, { ts, pending: false }).row);
-	          }
-	          const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
-	          chatInner.insertBefore(frag, anchor);
-            trimRenderedRows({ fromTop: true });
-	          rebuildDecorations({ preserveScroll: false });
-            markClickFirstPaint();
-	          // Ensure scroll-to-bottom happens after layout.
-	          requestAnimationFrame(() => {
-	            if (myToken !== backfillToken) return;
-	            scrollToBottom();
-	            requestAnimationFrame(() => {
-	              if (myToken !== backfillToken) return;
-	              scrollToBottom();
-	            });
-	          });
-	          backfillState = null;
-	        }
+          pollKickPending = false;
+
+          selected = sessionId;
+          localStorage.setItem("codexweb.selected", sessionId);
+          setSessionHash(sessionId);
+          activeLogPath = null;
+          activeThreadId = null;
+          liveCursor = null;
+          historyCursor = null;
+          turnOpen = false;
+          setAttachCount(0);
+          updateQueueBadge();
+          setStatus({ running: false, queueLen: 0 });
+          setContext(null);
+          setTyping(false);
+          resetChatRenderState();
+
+          const s = sessionIndex.get(sessionId);
+          titleLabel.textContent = s ? sessionTitleWithId(s) : sessionId ? String(sessionId) : "No session selected";
+          clickLoadT0 = performance.now();
+          clickMetricPending = true;
+          const optimisticBusy = Boolean(s && s.busy);
+          const optimisticQueueLen = s && Number.isFinite(Number(s.queue_len)) ? Number(s.queue_len) : 0;
+          turnOpen = optimisticBusy;
+          setStatus({ running: optimisticBusy, queueLen: optimisticQueueLen });
+          setContext(s ? s.token || null : null);
+          setTyping(optimisticBusy);
+
+          const cachedTail = s ? sessionTailCache.get(sessionId) : null;
+          if (useCache && s && cachedTail && tailCacheMatchesSession(cachedTail, s) && Array.isArray(cachedTail.events) && cachedTail.events.length) {
+            applyCachedTail(sessionId, cachedTail, s);
+          }
+
+          const data = await api(`/api/sessions/${sessionId}/messages/tail?limit=${initPageLimit()}`);
+          if (pollGen !== myGen || selected !== sessionId) return null;
+          renderSessionTail(Array.isArray(data.events) ? data.events : []);
+          applySessionRuntimeFromTail(sessionId, data);
+
+          kickPoll(900);
+          if (isMobile()) setSidebarOpen(false);
+          updateHarnessBtnState();
+          if (isFileViewerOpen() && !fileDirty) void ensureCurrentFileViewerSession();
+          return data;
+        }
 
 			        async function pollMessages(sid = selected, gen = pollGen) {
 			          if (!sid) return;
 			          try {
-	            const prevOffset = offset;
-	            const reqOffset = offset;
-		            const data = await api(`/api/sessions/${sid}/messages?offset=${reqOffset}`);
+	            if (!liveCursor) {
+	              await openSession(sid, { useCache: false });
+	              return;
+	            }
+	            const reqCursor = liveCursor;
+		            const data = await api(`/api/sessions/${sid}/messages/live?cursor=${encodeURIComponent(reqCursor)}`);
 	            if (gen !== pollGen || sid !== selected) return;
 	            const lp = data && typeof data.log_path === "string" ? data.log_path : null;
 	            const tid = data && typeof data.thread_id === "string" ? data.thread_id : null;
@@ -3415,100 +3398,58 @@
 	            if (activeLogPath && !lp) {
 	              activeLogPath = null;
 	              activeThreadId = tid;
-	              offset = 0;
 	              resetChatRenderState();
 	              setAttachCount(0);
 	              setTyping(false);
 	              turnOpen = false;
-	              setOlderState({ hasMore: false, isLoading: false });
-	              olderBefore = 0;
-                setCacheMeta(sid, { threadId: activeThreadId, logPath: null, offset: 0, olderBefore: 0, hasOlder: false });
-                replaceCacheEvents(sid, []);
-	              setStatus({ running: Boolean(nowBusy), queueLen: data.queue_len });
+	              setStatus({ running: nowBusy, queueLen: data.queue_len });
 	              setContext(data.token);
-	              setTyping(Boolean(nowBusy));
+	              setTyping(nowBusy);
 	              return;
 	            }
 	            if (activeLogPath && lp && lp !== activeLogPath) {
-	              activeLogPath = lp;
-	              activeThreadId = tid;
-	              offset = 0;
-	              resetChatRenderState();
-              setAttachCount(0);
-              setTyping(false);
-              turnOpen = false;
-              setStatus({ running: false, queueLen: 0 });
-              try {
-                const d2 = await api(`/api/sessions/${sid}/messages?offset=0&init=1&limit=${initPageLimit()}&before=0`);
-                if (gen !== pollGen || sid !== selected) return;
-                if (d2 && typeof d2.log_path === "string") activeLogPath = d2.log_path;
-                if (d2 && typeof d2.thread_id === "string") activeThreadId = d2.thread_id;
-                offset = d2.offset;
-                const evs2 = Array.isArray(d2.events) ? d2.events : [];
-                if (evs2.length) startInitialRender(evs2);
-                olderBefore = Number.isFinite(Number(d2.next_before)) ? Number(d2.next_before) : 0;
-                setOlderState({ hasMore: Boolean(d2.has_older), isLoading: false });
-                setCacheMeta(sid, {
-                  threadId: activeThreadId,
-                  logPath: activeLogPath,
-                  offset,
-                  olderBefore,
-                  hasOlder: Boolean(d2.has_older),
-                });
-	                const nowBusy2 = Boolean(d2.busy);
-	                const turnStart2 = Boolean(d2.turn_start);
-	                const turnEnd2 = Boolean(d2.turn_end);
-	                const turnAborted2 = Boolean(d2.turn_aborted);
-	                if (turnStart2 || nowBusy2) turnOpen = true;
-	                if (turnEnd2 || turnAborted2 || !nowBusy2) turnOpen = false;
-                setStatus({ running: Boolean(turnOpen || nowBusy2), queueLen: d2.queue_len });
-                setContext(d2.token);
-                setTyping(Boolean(turnOpen || nowBusy2));
-                } catch (e2) {
-                  console.error("poll init reload failed", e2);
-                  throw e2;
-                }
-                return;
-             }
-	
-		            offset = data.offset;
-              setCacheMeta(sid, { threadId: tid || activeThreadId, logPath: activeLogPath || lp || null, offset });
+	              await openSession(sid, { useCache: false });
+	              return;
+	            }
+
+	            liveCursor = typeof data.live_cursor === "string" && data.live_cursor ? data.live_cursor : null;
 	            const evs = Array.isArray(data.events) ? data.events : [];
-	            if (prevOffset === 0 && !chatInner.querySelector(".msg-row:not(.typing-row)") && evs.length) {
-	              startInitialRender(evs);
-            } else {
-              for (const ev of evs) appendEvent(ev);
-            }
+	            for (const ev of evs) appendEvent(ev);
 
             const turnStart = Boolean(data.turn_start);
             const turnEnd = Boolean(data.turn_end);
             const turnAborted = Boolean(data.turn_aborted);
-            if (turnStart) {
-              turnOpen = true;
-            }
-            if (!turnOpen && nowBusy) {
-              turnOpen = true;
-            }
-
-            if ((turnEnd || turnAborted) && turnOpen) {
-              turnOpen = false;
-            }
-		            if (turnOpen && !nowBusy) {
-		              turnOpen = false;
-		            }
+            if (turnStart) turnOpen = true;
+            if (!turnOpen && nowBusy) turnOpen = true;
+            if ((turnEnd || turnAborted) && turnOpen) turnOpen = false;
+		            if (turnOpen && !nowBusy) turnOpen = false;
 
 				            setStatus({ running: Boolean(turnOpen || nowBusy), queueLen: data.queue_len });
 				            setContext(data.token);
 				            setTyping(Boolean(turnOpen || nowBusy));
-	            const s = sessionIndex.get(sid);
-            if (s) titleLabel.textContent = sessionTitleWithId(s);
+	            const s2 = sessionIndex.get(sid);
+            if (evs.length) {
+              appendTailSnapshotEvents(sid, evs, {
+                session: s2,
+                liveCursor,
+                busy: Boolean(turnOpen || nowBusy),
+                queueLen: data.queue_len,
+                token: data.token,
+              });
+            }
+            if (s2) titleLabel.textContent = sessionTitleWithId(s2);
 		          } catch (e) {
             if (gen !== pollGen || sid !== selected) return;
+            if (e && e.status === 409) {
+              await openSession(sid, { useCache: false });
+              return;
+            }
             if (e && e.status === 404) {
               selected = null;
-              offset = 0;
               activeLogPath = null;
               activeThreadId = null;
+              liveCursor = null;
+              historyCursor = null;
               pollGen += 1;
               if (pollTimer) clearTimeout(pollTimer);
               pollTimer = null;
@@ -3572,68 +3513,18 @@
           pollTimer = setTimeout(pollLoop, ms);
         }
 
-        async function refreshInitPageState(sid, gen, { rerender = false } = {}) {
-          const data = await api(`/api/sessions/${sid}/messages?offset=0&init=1&limit=${initPageLimit()}&before=0`);
-          if (pollGen !== gen || selected !== sid) return null;
-          const nextLogPath = data && typeof data.log_path === "string" ? data.log_path : null;
-          const nextThreadId = data && typeof data.thread_id === "string" ? data.thread_id : null;
-          const nextOlderBefore = Number.isFinite(Number(data.next_before)) ? Number(data.next_before) : 0;
-          const nextHasOlder = Boolean(data.has_older);
-          const identityChanged = (activeLogPath || null) !== nextLogPath || (activeThreadId || null) !== nextThreadId;
-
-          activeLogPath = nextLogPath;
-          activeThreadId = nextThreadId;
-          olderBefore = nextOlderBefore;
-          setOlderState({ hasMore: nextHasOlder, isLoading: false });
-          setCacheMeta(sid, {
-            threadId: activeThreadId,
-            logPath: activeLogPath,
-            olderBefore,
-            hasOlder: nextHasOlder,
-          });
-
-          const nowBusy = Boolean(data.busy);
-          const turnStart = Boolean(data.turn_start);
-          const turnEnd = Boolean(data.turn_end);
-          const turnAborted = Boolean(data.turn_aborted);
-          if (turnStart || nowBusy) turnOpen = true;
-          if (turnEnd || turnAborted || !nowBusy) turnOpen = false;
-          setStatus({ running: Boolean(turnOpen || nowBusy), queueLen: data.queue_len });
-          setContext(data.token);
-          setTyping(Boolean(turnOpen || nowBusy));
-
-          if (rerender || identityChanged) {
-            offset = Number(data.offset) || 0;
-            resetChatRenderState();
-            const evs = Array.isArray(data.events) ? data.events : [];
-            if (evs.length) startInitialRender(evs);
-            else replaceCacheEvents(sid, []);
-            olderBefore = nextOlderBefore;
-            setOlderState({ hasMore: nextHasOlder, isLoading: false });
-            setCacheMeta(sid, {
-              threadId: activeThreadId,
-              logPath: activeLogPath,
-              offset,
-              olderBefore,
-              hasOlder: nextHasOlder,
-            });
-          }
-          return data;
-        }
-
         async function jumpToLatest() {
           if (!selected) return;
           const sid = selected;
-          const gen = pollGen;
           invalidateOlderLoad();
           autoScroll = true;
           try {
-            await refreshInitPageState(sid, gen, { rerender: true });
+            await openSession(sid, { useCache: false });
           } catch (e) {
-            if (selected !== sid || pollGen !== gen) return;
+            if (selected !== sid) return;
             setToast(`jump error: ${e && e.message ? e.message : "unknown error"}`);
           }
-          if (selected !== sid || pollGen !== gen) return;
+          if (selected !== sid) return;
           requestAnimationFrame(() => {
             scrollToBottom();
             syncJumpButton();
@@ -3641,81 +3532,9 @@
           kickPoll(0);
         }
 
-		        async function selectSession(id) {
-	          pollGen += 1;
-	          const myGen = pollGen;
-	          if (pollTimer) {
-	            clearTimeout(pollTimer);
-	            pollTimer = null;
-	          }
-		          pollKickPending = false;
-            const sid = id;
-            selected = sid;
-            offset = 0;
-            activeLogPath = null;
-            activeThreadId = null;
-            resetChatRenderState();
-            setAttachCount(0);
-            localStorage.setItem("codexweb.selected", sid);
-            setSessionHash(sid);
-            updateQueueBadge();
-            setStatus({ running: false, queueLen: 0 });
-            setContext(null);
-            setTyping(false);
-            turnOpen = false;
-		          {
-		            const s = sessionIndex.get(sid);
-            if (s) titleLabel.textContent = sessionTitleWithId(s);
-            else titleLabel.textContent = sid ? String(sid) : "No session selected";
-		          }
-                clickLoadT0 = performance.now();
-                clickMetricPending = true;
-          if (pollGen !== myGen || selected !== sid) return;
-			          const s0 = sessionIndex.get(sid);
-			          if (s0 && s0.token) setContext(s0.token);
-                const cached = getCache(sid);
-                if (cached && !cacheMatchesSession(cached, s0)) clearCache(sid);
-                const hasCached = Boolean(
-                  cached &&
-                    cacheMatchesSession(cached, s0) &&
-                    Array.isArray(cached.events) &&
-                    cached.events.length &&
-                    Number(cached.offset) > 0
-                );
-                if (hasCached) {
-                  activeThreadId = typeof cached.thread_id === "string" ? cached.thread_id : null;
-                  activeLogPath = typeof cached.log_path === "string" ? cached.log_path : null;
-                  offset = Number(cached.offset) || 0;
-                  olderBefore = Number(cached.older_before) || 0;
-                  setOlderState({ hasMore: Boolean(cached.has_older), isLoading: false });
-                  startInitialRender(cached.events);
-                  try {
-                    await refreshInitPageState(sid, myGen);
-                  } catch {
-                    // ignore and rely on poll refresh
-                  }
-                  try {
-                    await pollMessages(sid, myGen);
-                  } catch {
-                    // ignore and rely on next poll
-                  }
-                  if (pollGen !== myGen || selected !== sid) return;
-                } else {
-				            try {
-						            const data = await refreshInitPageState(sid, myGen, { rerender: true });
-					            if (pollGen !== myGen || selected !== sid) return;
-                    if (!data) return;
-			          } catch {
-			            await pollMessages(sid, myGen);
-			            if (pollGen !== myGen || selected !== sid) return;
-			          }
-                }
-            refreshSessions().catch((e) => console.error("refreshSessions failed", e));
-           kickPoll(900);
-           if (isMobile()) setSidebarOpen(false);
-           updateHarnessBtnState();
-           if (isFileViewerOpen() && !fileDirty) void ensureCurrentFileViewerSession();
-         }
+        async function selectSession(id) {
+          await openSession(id, { useCache: true });
+        }
 
         function parseHarnessDraftInt(name) {
           const raw = String(harnessNumberDraft[name] ?? "").trim();
@@ -3973,14 +3792,13 @@
           else localStorage.removeItem("codoxear.announcementEnabled");
           if (!localAnnouncementEnabled) {
             stopAnnouncementHeartbeat();
-            try {
-              liveAudio.pause();
-            } catch (_error) {}
-            liveAudio.removeAttribute("src");
-            liveAudio.load();
-            liveAudioStarted = false;
+            stopLiveAudioWatchdog();
+            if (liveAudioRetryTimer) clearTimeout(liveAudioRetryTimer);
+            liveAudioRetryTimer = null;
+            resetLiveAudioState();
           } else {
             startAnnouncementHeartbeat();
+            startLiveAudioWatchdog();
           }
           updateVoiceUi();
         }
@@ -4006,7 +3824,7 @@
           return Boolean(String(voiceSettings.tts_base_url || "").trim() && String(voiceSettings.tts_api_key || "").trim());
         }
 
-        function browserSupportsLiveAudioPlayback() {
+        function browserSupportsNativeLiveAudioPlayback() {
           if (!liveAudio || typeof liveAudio.canPlayType !== "function") return false;
           return ["application/vnd.apple.mpegurl", "audio/mpegurl"].some((kind) => {
             const result = liveAudio.canPlayType(kind);
@@ -4014,9 +3832,110 @@
           });
         }
 
+        function browserSupportsMseLiveAudioPlayback() {
+          const HlsCtor = window.Hls;
+          return !!(HlsCtor && typeof HlsCtor.isSupported === "function" && HlsCtor.isSupported());
+        }
+
+        function shouldPreferNativeLiveAudioPlayback() {
+          if (!browserSupportsNativeLiveAudioPlayback()) return false;
+          const vendor = String(navigator.vendor || "");
+          const ua = String(navigator.userAgent || "");
+          if (/Apple/i.test(vendor)) return true;
+          return /AppleWebKit/i.test(ua) && !/(?:Chrom(?:e|ium)|CriOS|Edg|OPR|Firefox|FxiOS)/i.test(ua);
+        }
+
+        function browserSupportsLiveAudioPlayback() {
+          return browserSupportsNativeLiveAudioPlayback() || browserSupportsMseLiveAudioPlayback();
+        }
+
         function liveAudioHasReadySegments() {
           const audio = voiceSettings && voiceSettings.audio ? voiceSettings.audio : {};
           return Number(audio.segment_count || 0) > 0;
+        }
+
+        function destroyLiveAudioHls() {
+          const current = liveAudioHls;
+          liveAudioHls = null;
+          if (!current || typeof current.destroy !== "function") return;
+          try {
+            current.destroy();
+          } catch (e) {
+            console.error("destroy live hls failed", e);
+          }
+        }
+
+        async function ensureLiveAudioPlaybackSource(nextSrc, { resetSource = false } = {}) {
+          if (resetSource) {
+            resetLiveAudioState();
+          }
+          if (shouldPreferNativeLiveAudioPlayback()) {
+            destroyLiveAudioHls();
+            if (resetSource || liveAudioSourceUrl !== nextSrc || liveAudio.currentSrc !== nextSrc) {
+              liveAudio.src = nextSrc;
+              liveAudioSourceUrl = nextSrc;
+            }
+            return;
+          }
+          if (!browserSupportsMseLiveAudioPlayback()) {
+            throw new Error("this browser does not support HLS audio playback in this app");
+          }
+          const HlsCtor = window.Hls;
+          const needsReload = resetSource || !liveAudioHls || liveAudioSourceUrl !== nextSrc;
+          if (!needsReload) return;
+          destroyLiveAudioHls();
+          liveAudio.removeAttribute("src");
+          liveAudio.load();
+          liveAudioSourceUrl = nextSrc;
+          const hls = new HlsCtor();
+          liveAudioHls = hls;
+          hls.on(HlsCtor.Events.ERROR, (_event, data) => {
+            if (!data) return;
+            console.error("live hls error", data.type, data.details, data);
+            if (!data.fatal || liveAudioHls !== hls) return;
+            switch (data.type) {
+              case HlsCtor.ErrorTypes.NETWORK_ERROR:
+                hls.startLoad();
+                return;
+              case HlsCtor.ErrorTypes.MEDIA_ERROR:
+                hls.recoverMediaError();
+                return;
+              default:
+                destroyLiveAudioHls();
+                liveAudioStarted = false;
+                liveAudioSuspectSinceTs = 0;
+                updateVoiceUi();
+                scheduleLiveAudioRetry(1200, { resetSource: true });
+            }
+          });
+          await new Promise((resolve, reject) => {
+            let settled = false;
+            const cleanup = () => {
+              hls.off(HlsCtor.Events.MEDIA_ATTACHED, onAttached);
+              hls.off(HlsCtor.Events.MANIFEST_PARSED, onManifestParsed);
+              hls.off(HlsCtor.Events.ERROR, onInitError);
+            };
+            const settle = (fn, value) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              fn(value);
+            };
+            const onAttached = () => {
+              hls.loadSource(nextSrc);
+            };
+            const onManifestParsed = () => {
+              settle(resolve);
+            };
+            const onInitError = (_event, data) => {
+              if (!data || !data.fatal) return;
+              settle(reject, new Error(data.details || data.type || "failed to load HLS stream"));
+            };
+            hls.on(HlsCtor.Events.MEDIA_ATTACHED, onAttached);
+            hls.on(HlsCtor.Events.MANIFEST_PARSED, onManifestParsed);
+            hls.on(HlsCtor.Events.ERROR, onInitError);
+            hls.attachMedia(liveAudio);
+          });
         }
 
         async function sendAnnouncementHeartbeat(enabled) {
@@ -4039,6 +3958,81 @@
           void sendAnnouncementHeartbeat(false);
         }
 
+        function markLiveAudioProgress() {
+          liveAudioLastProgressTs = Date.now();
+          liveAudioSuspectSinceTs = 0;
+          liveAudioLastCurrentTime = Number(liveAudio.currentTime || 0);
+        }
+
+        function resetLiveAudioState() {
+          destroyLiveAudioHls();
+          try {
+            liveAudio.pause();
+          } catch (_error) {}
+          liveAudio.removeAttribute("src");
+          liveAudio.load();
+          liveAudioStarted = false;
+          liveAudioSourceUrl = "";
+          liveAudioLastProgressTs = 0;
+          liveAudioLastCurrentTime = 0;
+          liveAudioSuspectSinceTs = 0;
+        }
+
+        function noteLiveAudioPotentialStall(_reason = "") {
+          if (!localAnnouncementEnabled) return;
+          if (!liveAudioStarted || liveAudio.paused || liveAudio.ended) return;
+          if (!liveAudioHasReadySegments()) return;
+          if (!liveAudioSuspectSinceTs) liveAudioSuspectSinceTs = Date.now();
+        }
+
+        function queueLiveAudioHardRestart(_reason = "") {
+          if (!localAnnouncementEnabled) return;
+          if (!browserSupportsLiveAudioPlayback()) return;
+          if (!liveAudioHasReadySegments()) return;
+          const now = Date.now();
+          if ((now - liveAudioLastRestartTs) < LIVE_AUDIO_RESTART_THROTTLE_MS) return;
+          liveAudioLastRestartTs = now;
+          liveAudioStarted = false;
+          liveAudioSuspectSinceTs = 0;
+          updateVoiceUi();
+          scheduleLiveAudioRetry(150, { resetSource: true });
+        }
+
+        function runLiveAudioWatchdog() {
+          if (!localAnnouncementEnabled) return;
+          if (!browserSupportsLiveAudioPlayback()) return;
+          if (!liveAudioHasReadySegments()) return;
+          const now = Date.now();
+          const currentTime = Number(liveAudio.currentTime || 0);
+          if (currentTime > liveAudioLastCurrentTime + 0.05) {
+            markLiveAudioProgress();
+            return;
+          }
+          liveAudioLastCurrentTime = currentTime;
+          if (!liveAudioStarted || liveAudio.paused || liveAudio.ended) {
+            liveAudioSuspectSinceTs = 0;
+            return;
+          }
+          if (!liveAudioSuspectSinceTs) liveAudioSuspectSinceTs = now;
+          const baselineTs = Math.max(liveAudioLastProgressTs || 0, liveAudioSuspectSinceTs || 0);
+          if (!baselineTs) return;
+          if ((now - baselineTs) < LIVE_AUDIO_STALL_GRACE_MS) return;
+          queueLiveAudioHardRestart("watchdog");
+        }
+
+        function stopLiveAudioWatchdog() {
+          if (liveAudioWatchdogTimer) clearInterval(liveAudioWatchdogTimer);
+          liveAudioWatchdogTimer = null;
+        }
+
+        function startLiveAudioWatchdog() {
+          runLiveAudioWatchdog();
+          if (liveAudioWatchdogTimer) clearInterval(liveAudioWatchdogTimer);
+          liveAudioWatchdogTimer = setInterval(() => {
+            runLiveAudioWatchdog();
+          }, LIVE_AUDIO_WATCHDOG_MS);
+        }
+
         function startAnnouncementHeartbeat() {
           void sendAnnouncementHeartbeat(true);
           if (announcementHeartbeatTimer) clearInterval(announcementHeartbeatTimer);
@@ -4047,11 +4041,21 @@
           }, 15000);
         }
 
+        function resumeAnnouncementRuntime({ resetSource = false } = {}) {
+          if (!localAnnouncementEnabled) return;
+          startAnnouncementHeartbeat();
+          startLiveAudioWatchdog();
+          if (!liveAudioStarted && browserSupportsLiveAudioPlayback() && liveAudioHasReadySegments()) {
+            scheduleLiveAudioRetry(150, { resetSource });
+          }
+        }
+
         function scheduleLiveAudioRetry(delayMs = 1200, { resetSource = true } = {}) {
           if (!localAnnouncementEnabled) return;
           if (liveAudioRetryTimer) clearTimeout(liveAudioRetryTimer);
           liveAudioRetryTimer = setTimeout(async () => {
             liveAudioRetryTimer = null;
+            if (!localAnnouncementEnabled) return;
             try {
               await startLiveAudioPlayback({ resetSource });
             } catch (e) {
@@ -4253,8 +4257,10 @@
             audio: data && typeof data.audio === "object" && data.audio ? data.audio : voiceSettings.audio,
             notifications: data && typeof data.notifications === "object" && data.notifications ? data.notifications : voiceSettings.notifications,
           };
-          if (liveAudioStarted && liveAudio.src !== currentVoiceStreamUrl()) {
-            liveAudio.src = currentVoiceStreamUrl();
+          if (liveAudioStarted && liveAudioSourceUrl !== currentVoiceStreamUrl()) {
+            void ensureLiveAudioPlaybackSource(currentVoiceStreamUrl(), { resetSource: true }).catch((e) => {
+              console.error("reload live audio source failed", e);
+            });
           }
           updateVoiceUi();
           if (localAnnouncementEnabled && !liveAudioStarted && browserSupportsLiveAudioPlayback() && liveAudioHasReadySegments()) {
@@ -4410,17 +4416,16 @@
 
         async function startLiveAudioPlayback({ resetSource = false } = {}) {
           if (!browserSupportsLiveAudioPlayback()) {
-            throw new Error("this browser does not support native HLS audio playback; use Safari or an installed iOS PWA");
+            throw new Error("this browser does not support HLS audio playback in this app");
           }
           if (!liveAudioHasReadySegments()) {
             throw new Error("no live audio segments are available yet; wait for the first announcement and try again");
           }
           const nextSrc = currentVoiceStreamUrl();
-          if (resetSource || liveAudio.currentSrc !== nextSrc) {
-            liveAudio.src = nextSrc;
-          }
+          await ensureLiveAudioPlaybackSource(nextSrc, { resetSource });
           await liveAudio.play();
           liveAudioStarted = true;
+          markLiveAudioProgress();
           updateVoiceUi();
         }
 
@@ -4428,7 +4433,7 @@
           const message = error && error.message ? String(error.message) : "";
           if (/unsupported/i.test(message)) {
             if (!browserSupportsLiveAudioPlayback()) {
-              return "this browser does not support native HLS audio playback; use Safari or an installed iOS PWA";
+              return "this browser does not support HLS audio playback in this app";
             }
             if (!liveAudioHasReadySegments()) {
               return "no live audio segments are available yet; wait for the first announcement and try again";
@@ -4488,20 +4493,39 @@
         };
         liveAudio.addEventListener("error", () => {
           liveAudioStarted = false;
+          liveAudioSuspectSinceTs = 0;
           updateVoiceUi();
           scheduleLiveAudioRetry(1200, { resetSource: true });
         });
         liveAudio.addEventListener("playing", () => {
           liveAudioStarted = true;
+          markLiveAudioProgress();
           updateVoiceUi();
+        });
+        liveAudio.addEventListener("timeupdate", () => {
+          markLiveAudioProgress();
+        });
+        liveAudio.addEventListener("waiting", () => {
+          noteLiveAudioPotentialStall("waiting");
+          runLiveAudioWatchdog();
+        });
+        liveAudio.addEventListener("stalled", () => {
+          noteLiveAudioPotentialStall("stalled");
+          runLiveAudioWatchdog();
+        });
+        liveAudio.addEventListener("suspend", () => {
+          noteLiveAudioPotentialStall("suspend");
+          runLiveAudioWatchdog();
         });
         liveAudio.addEventListener("ended", () => {
           liveAudioStarted = false;
+          liveAudioSuspectSinceTs = 0;
           updateVoiceUi();
           scheduleLiveAudioRetry(500, { resetSource: true });
         });
         liveAudio.addEventListener("pause", () => {
           liveAudioStarted = false;
+          liveAudioSuspectSinceTs = 0;
           updateVoiceUi();
         });
         narrationSettingToggle.onchange = (e) => {
@@ -5661,6 +5685,8 @@
           resetActiveFileBufferState();
           fileImage.removeAttribute("src");
           fileImage.style.display = "none";
+          filePdf.removeAttribute("src");
+          filePdf.style.display = "none";
           fileDiff.style.display = "block";
         }
 
@@ -5681,14 +5707,21 @@
           const preferred = preferredFileSelectionForSession(sid);
           if (preferred.path) {
             setFilePath(preferred.path, { line: preferred.line });
-            await openFilePath(preferred.path, { line: preferred.line });
+            try {
+              await openFilePathWithResolvedMode(preferred.path, { line: preferred.line });
+            } catch (e) {
+              fileStatus.textContent = `error: ${e && e.message ? e.message : "unable to inspect path"}`;
+            }
             return true;
           }
           const first = fileCandidateList.length ? fileCandidateList[0] : "";
           if (first) {
-            setFileViewMode("diff");
             setFilePath(first, { line: null });
-            await openFilePath(first, { line: null });
+            try {
+              await openFilePathWithResolvedMode(first, { line: null });
+            } catch (e) {
+              fileStatus.textContent = `error: ${e && e.message ? e.message : "unable to inspect path"}`;
+            }
             return true;
           }
           resetFileViewerPanel();
@@ -5755,7 +5788,7 @@
 
         function activeFileCanEnterEditMode() {
           if (!activeFilePath || fileSavePending) return false;
-          if (activeFileKind && activeFileKind !== "text") return false;
+          if (activeFileKind && !isTextFileKind(activeFileKind)) return false;
           if (fileViewMode === "file") return Boolean(activeFileEditable);
           return Boolean(activeFileEditable);
         }
@@ -5838,7 +5871,7 @@
           return Boolean(
             useTouchFileEditorControls() &&
             isFileViewerOpen() &&
-            activeFileKind === "text" &&
+            isTextFileKind(activeFileKind) &&
             fileViewMode !== "preview" &&
             getActiveFileCodeEditor()
           );
@@ -5965,18 +5998,13 @@
           });
         }
 
-        function deleteActiveFileSelection() {
-          const editor = getActiveFileCodeEditor();
-          if (!editor || !monacoNs || typeof editor.executeEdits !== "function" || typeof editor.getSelection !== "function") return false;
-          const selection = editor.getSelection();
-          if (isCollapsedFileSelection(selection)) return false;
-          if (typeof editor.pushUndoStop === "function") editor.pushUndoStop();
-          editor.executeEdits("file-touch-delete", [{ range: selection, text: "", forceMoveMarkers: true }]);
-          if (typeof editor.pushUndoStop === "function") editor.pushUndoStop();
-          resetFileTouchSelectionState({ collapse: true });
-          setFileDirty(getFileEditorText() !== String(activeFileText || ""));
-          focusActiveFileCodeEditor();
-          return true;
+        function bindFileTouchClick(button, handler) {
+          if (!button || typeof handler !== "function") return;
+          button.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            handler();
+          });
         }
 
         async function copyActiveFileSelection() {
@@ -6001,28 +6029,30 @@
           filePasteInput.value = "";
         }
 
-        async function showFilePasteDialog() {
-          if (!(fileEditMode && activeFileEditable && fileViewMode === "file" && activeFileKind === "text" && !fileSavePending)) return;
-          if (
-            window.isSecureContext &&
-            navigator.clipboard &&
-            typeof navigator.clipboard.readText === "function"
-          ) {
-            try {
-              const text = await navigator.clipboard.readText();
-              if (text) {
-                if (insertIntoActiveFileEditor(text)) {
-                  setToast("pasted");
-                  focusActiveFileCodeEditor();
-                  return;
-                }
-              }
-            } catch (_) {}
+        async function pasteFromClipboardIntoActiveFile() {
+          if (!(fileEditMode && activeFileEditable && fileViewMode === "file" && isTextFileKind(activeFileKind) && !fileSavePending)) return;
+          if (!(window.isSecureContext && navigator.clipboard && typeof navigator.clipboard.readText === "function")) {
+            setToast("paste unavailable");
+            focusActiveFileCodeEditor();
+            return;
           }
-          filePasteInput.value = "";
-          filePasteBackdrop.style.display = "block";
-          filePasteDialog.style.display = "flex";
-          setTimeout(() => filePasteInput.focus({ preventScroll: true }), 0);
+          try {
+            const text = await navigator.clipboard.readText();
+            if (!text) {
+              setToast("clipboard empty");
+              focusActiveFileCodeEditor();
+              return;
+            }
+            if (!insertIntoActiveFileEditor(text)) {
+              setToast("paste unavailable");
+              focusActiveFileCodeEditor();
+              return;
+            }
+            setToast("pasted");
+          } catch (e) {
+            setToast(`paste error: ${e && e.message ? e.message : "clipboard denied"}`);
+          }
+          focusActiveFileCodeEditor();
         }
 
         function positionAfterInsertedText(start, text) {
@@ -6242,6 +6272,7 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
             fileEditorModels = [fileEditor.getModel()].filter(Boolean);
             fileEditorChangeDisposable = fileEditor.onDidChangeModelContent(() => {
               if (fileEditorProgrammaticChange) return;
+              if (fileTouchSelectMode) resetFileTouchSelectionState();
               setFileDirty(getFileEditorText() !== String(activeFileText || ""));
             });
           } else {
@@ -6358,8 +6389,19 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           updateFileTouchToolbar();
         }
 
+        function renderBlockedFileNotice(rel, reason, viewerMaxBytes, size) {
+          disposeFileEditor();
+          fileDiff.innerHTML = "";
+          const body = el("div", { class: "fileBlockedNotice" }, [
+            el("div", { class: "title", text: "Preview unavailable" }),
+            el("p", { text: blockedFileMessage(rel, reason, viewerMaxBytes, size) }),
+          ]);
+          fileDiff.appendChild(body);
+          updateFileTouchToolbar();
+        }
+
         function setFileEditMode(nextMode) {
-          fileEditMode = Boolean(nextMode) && fileViewMode === "file" && activeFileKind === "text" && activeFileEditable;
+          fileEditMode = Boolean(nextMode) && fileViewMode === "file" && isTextFileKind(activeFileKind) && activeFileEditable;
           syncFileEditorReadOnly();
           updateFileEditButton();
         }
@@ -6388,7 +6430,7 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
         }
 
         async function saveActiveFileEdits({ exitEditMode = true } = {}) {
-          if (!fileViewerSessionId || !activeFilePath || activeFileKind !== "text" || !activeFileEditable) return false;
+          if (!fileViewerSessionId || !activeFilePath || !isTextFileKind(activeFileKind) || !activeFileEditable) return false;
           if (!fileDirty && !activeFileDraft) {
             if (exitEditMode) setFileEditMode(false);
             return true;
@@ -6508,13 +6550,15 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
 
         function applyFileMode() {
           const hasPath = Boolean(activeFilePath);
+          const entry = hasPath ? fileEntryMap.get(activeFilePath) : null;
           const canToggleMode = hasPath && !activeFileDraft;
           const isDiff = fileViewMode === "diff";
           const isPreview = fileViewMode === "preview";
-          const previewable = !activeFileDraft && isMarkdownPreviewable(activeFilePath);
+          const diffable = canToggleMode && Boolean(entry && entry.changed) && isDiffableFileKind(activeFileKind);
+          const previewable = !activeFileDraft && activeFileKind === "markdown";
           fileModeDiffBtn.classList.toggle("active", hasPath && isDiff);
           fileModePreviewBtn.classList.toggle("active", hasPath && isPreview);
-          fileModeDiffBtn.disabled = !canToggleMode;
+          fileModeDiffBtn.disabled = !diffable;
           fileModePreviewBtn.disabled = !canToggleMode;
           fileDownloadBtn.disabled = !hasPath || activeFileDraft;
           fileModePreviewBtn.style.display = previewable ? "" : "none";
@@ -6568,6 +6612,21 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
             if (e && e.status === 404) return { exists: false };
             throw e;
           }
+        }
+
+        async function resolveFileOpenMode(path, { changed = null } = {}) {
+          const inspect = await inspectSessionFilePath(path);
+          if (!inspect || !inspect.exists) throw new Error("file not found");
+          const kind = String(inspect.kind || "").trim();
+          const isChanged = changed == null ? Boolean(fileEntryMap.get(String(path || "").trim())?.changed) : Boolean(changed);
+          if (isChanged && isDiffableFileKind(kind)) return "diff";
+          if (kind === "markdown" && fileNonDiffMode === "preview") return "preview";
+          return "file";
+        }
+
+        async function openFilePathWithResolvedMode(path, { line = null, changed = null } = {}) {
+          const mode = await resolveFileOpenMode(path, { changed });
+          return await openFilePathWithGuard(path, { line, mode });
         }
 
         async function openDraftFilePath(path, { line = null } = {}) {
@@ -7001,14 +7060,16 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
               btn.appendChild(el("span", { class: "fileMenuPath", text: path }));
             }
             btn.onmousedown = (e) => e.preventDefault();
-            btn.onclick = () => {
+            btn.onclick = async () => {
               if (entry.createNew) {
                 void openDraftFilePathWithGuard(path);
                 return;
               }
-              const selectedEntry = fileEntryMap.get(path);
-              const mode = selectedEntry && selectedEntry.changed ? "diff" : isMarkdownPreviewable(path) && fileNonDiffMode === "preview" ? "preview" : "file";
-              void openFilePathWithGuard(path, { line: null, mode });
+              try {
+                await openFilePathWithResolvedMode(path, { line: null, changed: Boolean(fileEntryMap.get(path)?.changed) });
+              } catch (e) {
+                fileStatus.textContent = `error: ${e && e.message ? e.message : "unable to inspect path"}`;
+              }
             };
             filePickerMenu.appendChild(btn);
           }
@@ -7157,14 +7218,17 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           const preferredLine = explicitPath ? normalizeLineNumber(line) : preferredSelection.line;
           if (preferred) {
             setFilePath(preferred, { line: preferredLine });
-            void openFilePath(preferred, { line: preferredLine });
+            void openFilePathWithResolvedMode(preferred, { line: preferredLine }).catch((e) => {
+              fileStatus.textContent = `error: ${e && e.message ? e.message : "unable to inspect path"}`;
+            });
             return;
           }
           const first = fileCandidateList.length ? fileCandidateList[0] : "";
           if (first) {
-            setFileViewMode("diff");
             setFilePath(first, { line: null });
-            void openFilePath(first, { line: null });
+            void openFilePathWithResolvedMode(first, { line: null }).catch((e) => {
+              fileStatus.textContent = `error: ${e && e.message ? e.message : "unable to inspect path"}`;
+            });
             return;
           }
           resetFileViewerPanel();
@@ -7203,6 +7267,8 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           resetActiveFileBufferState();
           fileImage.removeAttribute("src");
           fileImage.style.display = "none";
+          filePdf.removeAttribute("src");
+          filePdf.style.display = "none";
           fileDiff.style.display = "block";
           try {
             const viewMode = fileViewMode === "preview" && !isMarkdownPreviewable(rel) ? "file" : fileViewMode;
@@ -7225,6 +7291,7 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
                 if (!rendered || !isCurrentFileOpenRequest(request)) return false;
                 fileStatus.textContent = `${rel} - diff`;
               }
+              applyFileMode();
               rememberOpenedFile(rel, res && typeof res.abs_path === "string" ? res.abs_path : null);
             } else {
               const res = await api(`/api/sessions/${request.sessionId}/file/read?path=${encodeURIComponent(rel)}`, {
@@ -7241,13 +7308,26 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
                 fileImage.style.display = "block";
                 const size = typeof res.size === "number" ? res.size : 0;
                 fileStatus.textContent = `${rel} - ${fmtBytes(size)}`;
+              } else if (res.kind === "pdf") {
+                activeFileKind = "pdf";
+                if (typeof res.pdf_url !== "string" || !res.pdf_url) throw new Error("invalid pdf response");
+                fileDiff.style.display = "none";
+                filePdf.src = resolveAppUrl(res.pdf_url);
+                filePdf.style.display = "block";
+                const size = typeof res.size === "number" ? res.size : 0;
+                fileStatus.textContent = `${rel} - PDF - ${fmtBytes(size)}`;
+              } else if (res.kind === "download_only") {
+                activeFileKind = "download_only";
+                const size = typeof res.size === "number" ? res.size : 0;
+                renderBlockedFileNotice(rel, String(res.reason || ""), Number(res.viewer_max_bytes || 0), size);
+                fileStatus.textContent = `${rel} - download only - ${fmtBytes(size)}`;
               } else {
                 if (typeof res.text !== "string") throw new Error("invalid response");
-                activeFileKind = "text";
+                activeFileKind = res.kind === "markdown" ? "markdown" : "text";
                 activeFileText = res.text;
                 activeFileEditable = Boolean(res.editable);
                 activeFileVersion = typeof res.version === "string" ? res.version : "";
-                if (viewMode === "preview" && isMarkdownPreviewable(rel)) {
+                if (viewMode === "preview" && activeFileKind === "markdown") {
                   renderMarkdownPreview(rel, res.text);
                 } else {
                   const rendered = await renderMonacoFile(rel, res.text, request.line, "", request);
@@ -7255,11 +7335,12 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
                 }
                 const size = typeof res.size === "number" ? res.size : res.text.length;
                 const statusParts = [rel];
-                if (viewMode === "preview" && isMarkdownPreviewable(rel)) statusParts.push("preview");
+                if (viewMode === "preview" && activeFileKind === "markdown") statusParts.push("preview");
                 if (!activeFileEditable) statusParts.push("read-only");
                 statusParts.push(fmtBytes(size));
                 fileStatus.textContent = statusParts.join(" - ");
               }
+              applyFileMode();
               rememberOpenedFile(rel, typeof res.path === "string" ? res.path : null);
             }
             rememberActiveFileSelection();
@@ -7346,8 +7427,9 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
               void openDraftFilePathWithGuard(active.path);
               return;
             }
-            const mode = active.changed ? "diff" : isMarkdownPreviewable(active.path) && fileNonDiffMode === "preview" ? "preview" : "file";
-            void openFilePathWithGuard(active.path, { line: null, mode });
+            void openFilePathWithResolvedMode(active.path, { line: null, changed: Boolean(active.changed) }).catch((err) => {
+              fileStatus.textContent = `error: ${err && err.message ? err.message : "unable to inspect path"}`;
+            });
             return;
           }
           if (e.key === "Escape" && fileMenuOpen) {
@@ -7383,7 +7465,7 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
             const changed = await setFileViewModeWithGuard("file");
             if (!changed) return;
           }
-          if (!activeFileEditable || activeFileKind !== "text") return;
+          if (!activeFileEditable || !isTextFileKind(activeFileKind)) return;
           setFileEditMode(true);
         };
         fileDownloadBtn.onclick = (e) => {
@@ -7402,11 +7484,11 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
         bindFileTouchPress(fileTouchSelectBtn, () => {
           toggleFileTouchSelectionMode();
         });
-        bindFileTouchPress(fileTouchCopyBtn, () => {
+        bindFileTouchClick(fileTouchCopyBtn, () => {
           void copyActiveFileSelection();
         });
-        bindFileTouchPress(fileTouchPasteBtn, () => {
-          void showFilePasteDialog();
+        bindFileTouchClick(fileTouchPasteBtn, () => {
+          void pasteFromClipboardIntoActiveFile();
         });
         bindFileTouchPress(fileTouchUpBtn, () => {
           focusActiveFileCodeEditor();
@@ -7551,20 +7633,18 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
             resetFileTouchSelectionState({ collapse: true });
             return;
           }
-          if ((key === "backspace" || key === "delete") && fileEditMode && activeFileEditable && fileViewMode === "file") {
-            e.preventDefault();
-            e.stopPropagation();
-            if (deleteActiveFileSelection()) return;
+          const allowEditorDelete = (key === "backspace" || key === "delete") && fileEditMode && activeFileEditable && fileViewMode === "file";
+          if (allowEditorDelete) {
             return;
           }
           const direction = key === "h" ? "left" : key === "j" ? "down" : key === "k" ? "up" : key === "l" ? "right" : "";
           if (!direction) {
             const blocksEdit =
               key === "enter" ||
-              key === "backspace" ||
-              key === "delete" ||
               key === "tab" ||
               key === " " ||
+              key === "backspace" ||
+              key === "delete" ||
               (key.length === 1 && !e.altKey && !e.ctrlKey && !e.metaKey);
             if (!blocksEdit) return;
             e.preventDefault();
@@ -7628,19 +7708,8 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
             const sid = sendChoicePending && sendChoicePending.sid;
             hideSendChoice();
             if (!raw || !sid) return;
-              clearComposer();
-              try {
-                const res = await api(`/api/sessions/${sid}/enqueue`, { method: "POST", body: { text: raw } });
-              const qn = res && typeof res.queue_len === "number" ? res.queue_len : null;
-                if (res && res.queued) setToast(`queued (${qn ?? "?"})`);
-                else setToast("sent");
-                pollFastUntilMs = Date.now() + 5000;
-                kickPoll(0);
-                await refreshSessions();
-              updateQueueBadge();
-            } catch (e) {
-              setToast(`queue error: ${e && e.message ? e.message : "unknown error"}`);
-            }
+            clearComposer();
+            await enqueueComposerText(raw, { sid });
           };
         if (sendChoiceCancelBtn)
           sendChoiceCancelBtn.onclick = () => {
@@ -7649,30 +7718,149 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
         sendChoiceBackdrop.onclick = () => hideSendChoice();
 
         const queueUpdateTimers = new Map();
+        const queueMutationLocks = new Set();
+        const queuePendingDeletes = new Set();
+        const queueDraftTexts = new Map();
         let queueLastEditMs = 0;
+        let queueSubmitBusy = false;
         let queueViewerSid = null;
         let queueViewerItems = [];
 
-        function scheduleQueueUpdate(sid, idx, text) {
+        function normalizeQueueItems(data) {
+          if (data && Array.isArray(data.items)) {
+            return data.items
+              .filter((item) => item && typeof item === "object")
+              .map((item) => ({
+                id: typeof item.id === "string" ? item.id : "",
+                text: typeof item.text === "string" ? item.text : "",
+                sending: !!item.sending,
+              }))
+              .filter((item) => item.id && item.text.trim());
+          }
+          if (data && Array.isArray(data.queue)) {
+            return data.queue
+              .filter((text) => typeof text === "string" && text.trim())
+              .map((text, idx) => ({ id: `legacy-${idx}`, text, sending: false }));
+          }
+          return [];
+        }
+
+        function syncQueueSubmitState() {
+          if (queueBtn) queueBtn.disabled = !!queueSubmitBusy;
+        }
+
+        async function enqueueComposerText(raw, { sid = null } = {}) {
+          const sessionId = sid || selected;
+          const text = String(raw || "");
+          if (!sessionId || !text.trim()) return;
+          if (queueSubmitBusy) return;
+          queueSubmitBusy = true;
+          syncQueueSubmitState();
+          try {
+            const res = await api(`/api/sessions/${sessionId}/enqueue`, { method: "POST", body: { text } });
+            const qn = res && typeof res.queue_len === "number" ? res.queue_len : null;
+            if (res && res.queued) setToast(`queued (${qn ?? "?"})`);
+            else setToast("sent");
+            pollFastUntilMs = Date.now() + 5000;
+            kickPoll(0);
+            await refreshSessions();
+            updateQueueBadge();
+            if (queueViewer.style.display === "flex" && (queueViewerSid || selected) === sessionId) {
+              await refreshQueueViewer();
+            }
+          } catch (e) {
+            setToast(`queue error: ${e && e.message ? e.message : "unknown error"}`);
+          } finally {
+            queueSubmitBusy = false;
+            syncQueueSubmitState();
+          }
+        }
+
+        async function deleteQueueItem(sid, itemId) {
+          const key = String(itemId || "");
+          if (!sid || !key) return;
+          const timerKey = `${sid}:${key}`;
+          const pendingUpdate = queueUpdateTimers.get(timerKey);
+          if (pendingUpdate) {
+            clearTimeout(pendingUpdate);
+            queueUpdateTimers.delete(timerKey);
+          }
+          if (queueMutationLocks.has(key)) {
+            queuePendingDeletes.add(key);
+            setToast("delete queued");
+            return;
+          }
+          queueLastEditMs = 0;
+          queuePendingDeletes.delete(key);
+          queueMutationLocks.add(key);
+          queueViewerItems = queueViewerItems.filter((item) => String(item.id || "") !== key);
+          queueDraftTexts.delete(key);
+          renderQueueList();
+          try {
+            await api(`/api/sessions/${sid}/queue/delete`, { method: "POST", body: { id: key } });
+            await refreshQueueViewer();
+            await refreshSessions();
+            updateQueueBadge();
+          } catch (e) {
+            await refreshQueueViewer();
+            setToast(`queue delete error: ${e && e.message ? e.message : "unknown error"}`);
+          } finally {
+            queueMutationLocks.delete(key);
+          }
+        }
+
+        async function moveQueueItem(sid, itemId, toIndex) {
+          const key = String(itemId || "");
+          if (!sid || !key) return;
+          if (queueMutationLocks.has(key)) {
+            setToast("queue item busy; retry in a moment");
+            return;
+          }
+          queueMutationLocks.add(key);
+          try {
+            await api(`/api/sessions/${sid}/queue/move`, { method: "POST", body: { id: key, to_index: toIndex } });
+            await refreshQueueViewer();
+            await refreshSessions();
+            updateQueueBadge();
+          } catch (e) {
+            setToast(`queue move error: ${e && e.message ? e.message : "unknown error"}`);
+          } finally {
+            queueMutationLocks.delete(key);
+          }
+        }
+
+        function scheduleQueueUpdate(sid, itemId, text) {
           if (!sid) return;
+          const itemKey = String(itemId || "");
+          if (!itemKey) return;
           if (!String(text || "").trim()) {
-            const key0 = `${sid}:${idx}`;
+            const key0 = `${sid}:${itemKey}`;
             const existing0 = queueUpdateTimers.get(key0);
             if (existing0) clearTimeout(existing0);
             queueUpdateTimers.delete(key0);
             return;
           }
-          const key = `${sid}:${idx}`;
+          const key = `${sid}:${itemKey}`;
           const existing = queueUpdateTimers.get(key);
           if (existing) clearTimeout(existing);
           const t = setTimeout(async () => {
             queueUpdateTimers.delete(key);
+            queueMutationLocks.add(itemKey);
             try {
-              await api(`/api/sessions/${sid}/queue/update`, { method: "POST", body: { index: idx, text } });
+              await api(`/api/sessions/${sid}/queue/update`, { method: "POST", body: { id: itemKey, text } });
+              queueLastEditMs = 0;
+              queueDraftTexts.set(itemKey, text);
+              await refreshQueueViewer();
               await refreshSessions();
               updateQueueBadge();
             } catch (e) {
               setToast(`queue update error: ${e && e.message ? e.message : "unknown error"}`);
+            } finally {
+              queueMutationLocks.delete(itemKey);
+              if (queuePendingDeletes.has(itemKey)) {
+                queuePendingDeletes.delete(itemKey);
+                void deleteQueueItem(sid, itemKey);
+              }
             }
           }, 350);
           queueUpdateTimers.set(key, t);
@@ -7688,29 +7876,58 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           const q = Array.isArray(queueViewerItems) ? queueViewerItems : [];
           queueEmpty.style.display = q.length ? "none" : "block";
           if (!q.length) return;
-          q.forEach((text, idx) => {
+          const autosizeQueueText = (ta) => {
+            if (!ta) return;
+            ta.style.height = "0px";
+            ta.style.height = `${Math.max(58, Math.min(220, ta.scrollHeight))}px`;
+          };
+          const minMoveIndex = q[0] && q[0].sending ? 1 : 0;
+          q.forEach((item, idx) => {
+            const itemId = String(item.id || "");
+            const sending = !!item.sending;
+            const locked = sending || queueMutationLocks.has(itemId);
             const row = el("div", { class: "queueItem" });
+            const editorShell = el("div", { class: "queueEditorShell" });
             const ta = el("textarea", { class: "queueText", "aria-label": `Queued message ${idx + 1}` });
-            ta.value = text;
+            ta.value = queueDraftTexts.has(itemId) ? String(queueDraftTexts.get(itemId) || "") : String(item.text || "");
+            ta.disabled = locked;
             ta.oninput = () => {
               queueLastEditMs = Date.now();
-              scheduleQueueUpdate(sid, idx, String(ta.value || ""));
+              const nextText = String(ta.value || "");
+              queueDraftTexts.set(itemId, nextText);
+              autosizeQueueText(ta);
+              scheduleQueueUpdate(sid, itemId, nextText);
             };
-            const del = el("button", { class: "icon-btn danger", title: "Delete", "aria-label": "Delete", type: "button", html: iconSvg("trash") });
+            autosizeQueueText(ta);
+            editorShell.appendChild(ta);
+            const actions = el("div", { class: "queueActionRail" });
+            if (sending) actions.appendChild(el("div", { class: "queueSendingTag muted", text: "Sending" }));
+            const up = el("button", { class: "icon-btn queueIconBtn", title: "Move up", "aria-label": "Move up", type: "button", html: iconSvg("up") });
+            up.disabled = locked || idx <= minMoveIndex;
+            up.onclick = (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              void moveQueueItem(sid, itemId, idx - 1);
+            };
+            const down = el("button", { class: "icon-btn queueIconBtn", title: "Move down", "aria-label": "Move down", type: "button", html: iconSvg("down") });
+            down.disabled = locked || idx >= q.length - 1;
+            down.onclick = (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              void moveQueueItem(sid, itemId, idx + 1);
+            };
+            const del = el("button", { class: "icon-btn queueIconBtn danger", title: "Delete", "aria-label": "Delete", type: "button", html: iconSvg("trash") });
+            del.disabled = locked;
             del.onclick = async (e) => {
               e.preventDefault();
               e.stopPropagation();
-              try {
-                await api(`/api/sessions/${sid}/queue/delete`, { method: "POST", body: { index: idx } });
-                await refreshQueueViewer();
-                await refreshSessions();
-                updateQueueBadge();
-              } catch (e2) {
-                setToast(`queue delete error: ${e2 && e2.message ? e2.message : "unknown error"}`);
-              }
+              await deleteQueueItem(sid, itemId);
             };
-            row.appendChild(ta);
-            row.appendChild(del);
+            actions.appendChild(up);
+            actions.appendChild(down);
+            actions.appendChild(del);
+            row.appendChild(editorShell);
+            row.appendChild(actions);
             queueList.appendChild(row);
           });
         }
@@ -7723,7 +7940,23 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           try {
             const data = await api(`/api/sessions/${sid}/queue`);
             if (queueViewerSid && queueViewerSid !== sid) return;
-            const q = data && Array.isArray(data.queue) ? data.queue.filter((x) => typeof x === "string") : [];
+            const q = normalizeQueueItems(data);
+            const nextDrafts = new Map();
+            q.forEach((item) => {
+              const itemId = String(item.id || "");
+              if (!itemId) return;
+              if (queueDraftTexts.has(itemId)) {
+                const draft = String(queueDraftTexts.get(itemId) || "");
+                if (draft.trim()) {
+                  item.text = draft;
+                  nextDrafts.set(itemId, draft);
+                  return;
+                }
+              }
+              nextDrafts.set(itemId, String(item.text || ""));
+            });
+            queueDraftTexts.clear();
+            nextDrafts.forEach((value, key) => queueDraftTexts.set(key, value));
             queueViewerSid = sid;
             queueViewerItems = q;
             queueEmpty.textContent = "No queued messages.";
@@ -7783,8 +8016,7 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
               const t = Number(ts);
               if (!Number.isFinite(t) || t <= 0) return "";
               const s = Math.max(0, Math.floor(now - t));
-              const a = fmtIdleAge(s);
-              return a ? `${a} ago` : "";
+              return fmtRelativeAge(s);
             };
             addRow("Session", d && d.session_id ? d.session_id : "-");
             addRow("Thread", d && d.thread_id ? d.thread_id : "-");
@@ -7842,25 +8074,13 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
               if (!selected) return;
               const sid = selected;
               clearComposer();
-              void (async () => {
-                try {
-                  const res = await api(`/api/sessions/${sid}/enqueue`, { method: "POST", body: { text: raw } });
-                  const qn = res && typeof res.queue_len === "number" ? res.queue_len : null;
-                  if (res && res.queued) setToast(`queued (${qn ?? "?"})`);
-                  else setToast("sent");
-                  pollFastUntilMs = Date.now() + 5000;
-                  kickPoll(0);
-                  await refreshSessions();
-                  updateQueueBadge();
-                } catch (e2) {
-                  setToast(`queue error: ${e2 && e2.message ? e2.message : "unknown error"}`);
-                }
-              })();
+              void enqueueComposerText(raw, { sid });
               return;
             }
             showQueueViewer();
           };
         }
+        syncQueueSubmitState();
         queueCloseBtn.onclick = (e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -8122,6 +8342,9 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           }
         };
         setAttachCount(0);
+        const attachHint = `Attach file (max ${fmtBytes(ATTACH_UPLOAD_MAX_BYTES)})`;
+        attachBtn.title = attachHint;
+        attachBtn.setAttribute("aria-label", attachHint);
         updateQueueBadge();
 	        function autoGrow() {
 	          const basePx = parseFloat(getComputedStyle(textarea).minHeight || "0") || 32;
@@ -8264,7 +8487,7 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
 	            }
 
 	            setToast("uploading file...");
-	            const maxBytes = 10 * 1024 * 1024;
+	            const maxBytes = ATTACH_UPLOAD_MAX_BYTES;
 	            let uploadBlob = f;
 	            let uploadName = f.name || "file";
 	            if (looksLikeImage(f) && (f.size > maxBytes || isLikelyHeic(f))) {
@@ -8284,14 +8507,14 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
 	                blob = await toJpegBlob(f, t);
 	                if (blob.size <= maxBytes) break;
 	              }
-	              if (!blob || blob.size > maxBytes) throw new Error("image too large");
+	              if (!blob || blob.size > maxBytes) throw new Error(`image too large (max ${fmtBytes(maxBytes)})`);
 	              uploadBlob = blob;
 	            }
 
 	            const ab = await uploadBlob.arrayBuffer();
-	            if (ab.byteLength > maxBytes) throw new Error("file too large");
+	            if (ab.byteLength > maxBytes) throw new Error(`file too large (max ${fmtBytes(maxBytes)})`);
 		            const b64 = b64FromBytes(new Uint8Array(ab));
-			            const res = await api(`/api/sessions/${selected}/inject_image`, {
+			            const res = await api(`/api/sessions/${selected}/inject_file`, {
 		              method: "POST",
 		              body: { filename: uploadName, data_b64: b64, attachment_index: attachedFiles + 1 },
 		            });
@@ -8324,7 +8547,7 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           const t0 = Date.now() / 1000;
           const renderHere = sessionId === selected;
           if (renderHere) {
-            pendingUser.push({ id: localId, key: pendingMatchKey(raw), loose: normalizeTextForPendingMatch(raw), t0, text: raw });
+            pendingUser.push({ id: localId, sessionId, key: pendingMatchKey(raw), loose: normalizeTextForPendingMatch(raw), t0, text: raw });
             appendEvent({ role: "user", text: raw, pending: true, localId, ts: t0 });
             turnOpen = true;
             currentRunning = true;
@@ -8336,7 +8559,7 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
             setAttachCount(0);
             pollFastUntilMs = Date.now() + 5000;
             kickPoll(0);
-            await refreshSessions();
+            void refreshSessions().catch((e) => console.error("refreshSessions failed", e));
           } catch (e2) {
             setToast(`send error: ${e2.message}`);
             if (renderHere) {
@@ -8374,14 +8597,16 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
 	          try {
               await loadVoiceSettings();
               await syncNotificationState();
-              if (localAnnouncementEnabled) startAnnouncementHeartbeat();
+              if (localAnnouncementEnabled) {
+                resumeAnnouncementRuntime({ resetSource: false });
+              }
               if (notificationsEnabledLocally()) await pollNotificationFeed({ prime: true });
 	            const sessions = await refreshSessions();
               const hashed = sessionIdFromHash();
 	            const remembered = localStorage.getItem("codexweb.selected");
 	            const first = sessions && sessions.length ? sessions[0].session_id : null;
 	            const pick = hashed && sessionIndex.has(hashed) ? hashed : remembered && sessionIndex.has(remembered) ? remembered : first;
-	            if (pick) selectSession(pick);
+	            if (pick) await selectSession(pick);
 	          } catch (e) {
 	            if (e && e.status === 401) {
 	              renderLogin(renderApp);
@@ -8417,6 +8642,20 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
               });
               window.addEventListener("beforeunload", () => {
                 stopAnnouncementHeartbeat();
+                stopLiveAudioWatchdog();
+              });
+              document.addEventListener("visibilitychange", () => {
+                if (document.visibilityState !== "visible") return;
+                resumeAnnouncementRuntime({ resetSource: false });
+              });
+              window.addEventListener("pageshow", () => {
+                resumeAnnouncementRuntime({ resetSource: false });
+              });
+              window.addEventListener("online", () => {
+                resumeAnnouncementRuntime({ resetSource: true });
+              });
+              window.addEventListener("focus", () => {
+                resumeAnnouncementRuntime({ resetSource: false });
               });
 	          }
 	        })();
