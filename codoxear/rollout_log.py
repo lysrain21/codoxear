@@ -422,6 +422,11 @@ def _iter_jsonl_records_reverse(path: Path, *, before: int | None = None, block_
                 yield record
 
 
+def _chat_events_for_record(obj: dict[str, Any]) -> list[dict[str, Any]]:
+    events, _meta, _flags, _diag = _extract_chat_events([obj])
+    return events
+
+
 def _read_chat_page_reverse(
     log_path: Path,
     *,
@@ -440,14 +445,19 @@ def _read_chat_page_reverse(
     skipped = 0
     has_older = False
     for record in _iter_jsonl_records_reverse(log_path, before=end):
-        event = _single_chat_event(record.obj)
-        if event is None:
+        record_events = _chat_events_for_record(record.obj)
+        if not record_events:
             continue
         if skipped < skip:
-            skipped += 1
-            continue
+            remaining_skip = skip - skipped
+            if remaining_skip >= len(record_events):
+                skipped += len(record_events)
+                continue
+            # Do not split one log record across byte-cursor pages.
+            skipped = skip
         if len(newest_first) < page_limit:
-            newest_first.append(PositionedChatEvent(event=event, start=record.start, end=record.end))
+            for event in reversed(record_events):
+                newest_first.append(PositionedChatEvent(event=event, start=record.start, end=record.end))
             continue
         has_older = True
         break
